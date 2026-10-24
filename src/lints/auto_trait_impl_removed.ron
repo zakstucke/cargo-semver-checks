@@ -20,7 +20,7 @@ SemverQuery(
                         }
 
                         impl {
-                            negative @filter(op: "=", value: ["$false"])
+                            negative @filter(op: "!=", value: ["$true"])
 
                             implemented_trait {
                                 trait {
@@ -50,7 +50,7 @@ SemverQuery(
                         }
 
                         impl @fold @transform(op: "count") @filter(op: "=", value: ["$zero"]) {
-                            negative @filter(op: "=", value: ["$false"])
+                            negative @filter(op: "!=", value: ["$true"])
 
                             implemented_trait {
                                 trait {
@@ -74,7 +74,6 @@ SemverQuery(
     arguments: {
         "public": "public",
         "zero": 0,
-        "false": false,
         "true": true,
         "auto_traits": [
             ["core", "marker", "Send"],

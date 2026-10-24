@@ -12,6 +12,8 @@ on:
         required: true
         type: string
 
+permissions: {}
+
 concurrency:
   group: build-binaries
 
@@ -21,8 +23,56 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  build-and-upload-binary:
+  build-script-policy:
+    name: Reject unapproved build scripts
+    if: >-
+      github.ref_type == 'branch' &&
+      github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Checkout the trusted build-script policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Preserve the trusted build-script policy outside the worktree
+        run: |
+          set -euo pipefail
+          policy_dir="$RUNNER_TEMP/trusted-build-script-policy"
+          mkdir "$policy_dir"
+          cp -- .github/build-script-exceptions.txt "$policy_dir/"
+          cp -- .github/scripts/check_build_scripts.py "$policy_dir/"
+
+      - name: Checkout the release tag without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.publish-tag }}
+          persist-credentials: false
+
+      - name: Record and validate the release source
+        id: source
+        run: |
+          set -euo pipefail
+          policy_dir="$RUNNER_TEMP/trusted-build-script-policy"
+          # The release tag may omit scripts approved by the current policy.
+          # Allow absence only; present scripts still require an exact path and digest.
+          python3 "$policy_dir/check_build_scripts.py" \
+            --repository "$GITHUB_WORKSPACE" \
+            --exceptions "$policy_dir/build-script-exceptions.txt" \
+            --allow-missing-approved-build-scripts
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build-binary:
     name: Build ${{ matrix.target }}
+    needs:
+      - build-script-policy
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -39,22 +89,82 @@ jobs:
     runs-on: ${{ matrix.os || 'ubuntu-22.04' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.build-script-policy.outputs.source_sha }}
           persist-credentials: false
 
       - name: Install rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: stable
+          rustflags: ""
+          build-warnings: ""
+          cache: false
 
-      - name: Upload binary
-        uses: taiki-e/upload-rust-binary-action@v1
+      - name: Build and package binary
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
           bin: cargo-semver-checks
           target: ${{ matrix.target }}
           ref: refs/tags/${{ inputs.publish-tag }}
           tar: all
           zip: windows
+          dry-run: true
+          dry-run-intended: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
           CARGO_PROFILE_RELEASE_LTO: true
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binary-${{ matrix.target }}
+          path: |
+            cargo-semver-checks-${{ matrix.target }}.tar.gz
+            cargo-semver-checks-${{ matrix.target }}.zip
+          retention-days: 1
+          if-no-files-found: error
+
+  # This job handles release credentials but never checks out or executes repository code.
+  upload-binaries:
+    name: Upload binaries
+    needs:
+      - build-binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binary-*
+          path: ${{ runner.temp }}/release-assets
+          merge-multiple: true
+
+      - name: Upload binaries to the GitHub release
+        env:
+          ASSET_DIR: ${{ runner.temp }}/release-assets
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_TAG: ${{ inputs.publish-tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(
+            "$ASSET_DIR"/cargo-semver-checks-*.tar.gz
+            "$ASSET_DIR"/cargo-semver-checks-*.zip
+          )
+          if [[ "${#assets[@]}" -lt 8 ]]; then
+            echo "Expected at least 8 release assets, found ${#assets[@]}" >&2
+            exit 1
+          fi
+
+          for delay in {1..10}; do
+            if gh release upload "$PUBLISH_TAG" "${assets[@]}" \
+                --clobber --repo "$GITHUB_REPOSITORY"; then
+              exit 0
+            fi
+            sleep "$delay"
+          done
+          gh release upload "$PUBLISH_TAG" "${assets[@]}" \
+            --clobber --repo "$GITHUB_REPOSITORY"

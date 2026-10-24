@@ -102,4 +102,122 @@ source: src/query.rs
       "visibility_limit": String("public"),
     },
   ],
+  "./test_crates/function_no_longer_variadic/": [
+    {
+      "name": String("becomes_private"),
+      "path": List([
+        String("function_no_longer_variadic"),
+        String("becomes_private"),
+      ]),
+      "span_begin_line": Uint64(77),
+      "span_end_line": Uint64(77),
+      "span_filename": String("src/lib.rs"),
+      "visibility_limit": String("public"),
+    },
+    {
+      "name": String("removed_function"),
+      "path": List([
+        String("function_no_longer_variadic"),
+        String("removed_function"),
+      ]),
+      "span_begin_line": Uint64(81),
+      "span_end_line": Uint64(81),
+      "span_filename": String("src/lib.rs"),
+      "visibility_limit": String("public"),
+    },
+  ],
+  "./test_crates/function_now_variadic/": [
+    {
+      "name": String("becomes_private"),
+      "path": List([
+        String("function_now_variadic"),
+        String("becomes_private"),
+      ]),
+      "span_begin_line": Uint64(79),
+      "span_end_line": Uint64(79),
+      "span_filename": String("src/lib.rs"),
+      "visibility_limit": String("public"),
+    },
+    {
+      "name": String("removed_function"),
+      "path": List([
+        String("function_now_variadic"),
+        String("removed_function"),
+      ]),
+      "span_begin_line": Uint64(83),
+      "span_end_line": Uint64(83),
+      "span_filename": String("src/lib.rs"),
+      "visibility_limit": String("public"),
+    },
+  ],
+  "./test_crates/hidden_reexports/": [
+    {
+      "name": String("deprecated_hidden_glob_removed"),
+      "path": List([
+        String("hidden_reexports"),
+        String("deprecated_hidden_glob_removed"),
+      ]),
+      "span_begin_line": Uint64(32),
+      "span_end_line": Uint64(32),
+      "span_filename": String("src/lib.rs"),
+      "visibility_limit": String("public"),
+    },
+    {
+      "name": String("deprecated_hidden_per_item_removed"),
+      "path": List([
+        String("hidden_reexports"),
+        String("deprecated_hidden_per_item_removed"),
+      ]),
+      "span_begin_line": Uint64(41),
+      "span_end_line": Uint64(41),
+      "span_filename": String("src/lib.rs"),
+      "visibility_limit": String("public"),
+    },
+    {
+      "name": String("hidden_per_item_then_public_per_item_removed"),
+      "path": List([
+        String("hidden_reexports"),
+        String("hidden_per_item_then_public_per_item_removed"),
+      ]),
+      "span_begin_line": Uint64(79),
+      "span_end_line": Uint64(79),
+      "span_filename": String("src/lib.rs"),
+      "visibility_limit": String("public"),
+    },
+    {
+      "name": String("hidden_glob_then_public_per_item_removed"),
+      "path": List([
+        String("hidden_reexports"),
+        String("hidden_glob_then_public_per_item_removed"),
+      ]),
+      "span_begin_line": Uint64(101),
+      "span_end_line": Uint64(101),
+      "span_filename": String("src/lib.rs"),
+      "visibility_limit": String("public"),
+    },
+  ],
+  "./test_crates/stability_aware_mode/": [
+    {
+      "name": String("stable_removed"),
+      "path": List([
+        String("stability_aware_mode"),
+        String("stable_removed"),
+      ]),
+      "span_begin_line": Uint64(12),
+      "span_end_line": Uint64(12),
+      "span_filename": String("src/lib.rs"),
+      "visibility_limit": String("public"),
+    },
+    {
+      "name": String("unstable_removed"),
+      "path": List([
+        String("stability_aware_mode"),
+        String("unstable_removed"),
+      ]),
+      "span_begin_line": Uint64(15),
+      "span_end_line": Uint64(15),
+      "span_filename": String("src/lib.rs"),
+      "visibility_limit": String("public"),
+    },
+  ],
 }

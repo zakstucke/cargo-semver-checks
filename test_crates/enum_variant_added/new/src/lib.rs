@@ -2,7 +2,7 @@
 
 pub enum EnumWithNewVariant {
     OldVariant,
-    
+
     OldStructVariant {
         x: i64,
     },
@@ -19,4 +19,12 @@ pub enum NonExhaustiveEnumWithNewVariant {
     OldVariant,
 
     NewVariant,
+}
+
+pub enum EnumWithNonExhaustiveTupleVariant {
+    #[non_exhaustive]
+    Existing(i64),
+    #[non_exhaustive]
+    Unit,
+    Added,
 }

@@ -14,7 +14,7 @@ SemverQuery(
                         visibility_limit @filter(op: "=", value: ["$public"])
 
                         impl {
-                            negative @filter(op: "=", value: ["$false"])
+                            negative @filter(op: "!=", value: ["$true"])
                             attrs @filter(op: "contains", value: ["$derived"])
 
                             implemented_trait {
@@ -30,12 +30,12 @@ SemverQuery(
                             path @tag @output
                             public_api @filter(op: "=", value: ["$true"])
                         }
-                        
+
                         variant {
                             ... on StructVariant {
                                 variant_name: name @output @tag
                                 public_api_eligible @filter(op: "=", value: ["$true"])
-                                
+
                                 field {
                                     field_name: name @output @tag
                                     public_api_eligible @filter(op: "=", value: ["$true"])
@@ -53,7 +53,7 @@ SemverQuery(
                         name @output
 
                         impl {
-                            negative @filter(op: "=", value: ["$false"])
+                            negative @filter(op: "!=", value: ["$true"])
                             attrs @filter(op: "contains", value: ["$derived"])
 
                             implemented_trait {
@@ -74,7 +74,7 @@ SemverQuery(
                             ... on StructVariant {
                                 name @filter(op: "=", value: ["%variant_name"])
                                 public_api_eligible @filter(op: "=", value: ["$true"])
-                                
+
                                 field {
                                     name @filter(op: "=", value: ["%field_name"])
                                     public_api_eligible @filter(op: "=", value: ["$true"])
@@ -95,7 +95,6 @@ SemverQuery(
     arguments: {
         "public": "public",
         "derived": "#[automatically_derived]",
-        "false": false,
         "true": true,
         "partial_ord": ["core", "cmp", "PartialOrd"],
     },

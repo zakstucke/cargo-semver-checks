@@ -8,9 +8,13 @@ on:
   schedule:
     - cron: '17 7 * * 1-5'  # run once per day Monday-Friday at 7:17am
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A main-branch run may publish a release, so do not cancel in-progress push or scheduled runs.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   RUST_BACKTRACE: 1
@@ -22,21 +26,99 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
+  # This job is a prerequisite for every job that may execute Cargo against this
+  # repository. Keep the checker and its content-pinned exceptions in `.github/`.
+  build-script-policy:
+    name: Reject unapproved build scripts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Enforce the build-script policy
+        run: python3 .github/scripts/check_build_scripts.py
+
+  actionlint:
+    name: Lint GitHub Actions workflows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download actionlint
+        id: actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          # Update this digest together with ACTIONLINT_VERSION, using the release's checksums asset.
+          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          set -euo pipefail
+          tool_dir="$(mktemp -d "$RUNNER_TEMP/actionlint.XXXXXX")"
+          archive="$tool_dir/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum --check --strict -
+          tar -xzf "$archive" -C "$tool_dir" actionlint
+          echo "executable=$tool_dir/actionlint" >> "$GITHUB_OUTPUT"
+
+      - name: Check workflow files
+        # - https://www.shellcheck.net/wiki/SC2016 - "Expressions don't expand in single quotes, use double quotes for that."
+        env:
+          ACTIONLINT: ${{ steps.actionlint.outputs.executable }}
+        run: |
+          "$ACTIONLINT" -color -ignore 'SC2016'
+
+  zizmor:
+    name: Run zizmor
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          persona: regular
+          online-audits: true
+          min-severity: medium
+          min-confidence: medium
+          advanced-security: false
+          annotations: true
+
+  # Every job listed in `needs` must run on every workflow event. GitHub propagates
+  # a skipped dependency through the entire dependency chain even when this job uses
+  # `always()`, so making a dependency pull-request-only would also skip publishing
+  # and other downstream jobs.
   ci-everything:
     name: All CI stages
     runs-on: ubuntu-latest
+    permissions: {}
     needs:
+      - build-script-policy
+      - actionlint
+      - zizmor
       - lint
       - rust-tests
       - cargo-check-test-crates
       - check-test-crate-lockfiles
       - cross-version-caching
       - cross-feature-caching
-      - run-on-rust-libp2p
-      - run-on-libp2p-dcutr-relay
-      - run-on-libp2p-gossipsub-request-response
-      - run-on-libp2p-uds
-      - run-on-libp2p-whose-dependency-has-warnings
+      - run-on-pest-meta-feature-parity
+      - run-on-renamed-reexports
+      - run-on-reexported-generic-defaults
       - run-on-core-graphics
       - run-on-bevy-core
       - run-on-bevy-gltf
@@ -45,25 +127,29 @@ jobs:
       - run-on-cargo-config-linux
       - run-on-ref-slice-fork
       - run-on-ref-slice-fork-windows
+      - run-on-bare-repository
       - run-on-tokio-explicit
       - run-on-tokio-implicit
       - run-on-perf-event-open-sys2
       - fails-on-too-old-rustc
       - broken-lint-reference-links
-    if: ${{ success() || failure() }}  # Run this job even if a dependency has failed.
+      - whitespace-hygiene
+    if: ${{ always() && !cancelled() }}  # Run even if a dependency fails, unless the workflow is cancelled.
     steps:
       - name: Job outcomes
         run: |
+          echo "build-script-policy: ${{ needs.build-script-policy.result }}"
+          echo "actionlint: ${{ needs.actionlint.result }}"
+          echo "zizmor: ${{ needs.zizmor.result }}"
           echo "lint: ${{ needs.lint.result }}"
           echo "rust-tests: ${{ needs.rust-tests.result }}"
+          echo "cargo-check-test-crates: ${{ needs.cargo-check-test-crates.result }}"
           echo "check-test-crate-lockfiles: ${{ needs.check-test-crate-lockfiles.result }}"
           echo "cross-version-caching: ${{ needs.cross-version-caching.result }}"
           echo "cross-feature-caching: ${{ needs.cross-feature-caching.result }}"
-          echo "run-on-rust-libp2p: ${{ needs.run-on-rust-libp2p.result }}"
-          echo "run-on-libp2p-dcutr-relay: ${{ needs.run-on-libp2p-dcutr-relay.result }}"
-          echo "run-on-libp2p-gossipsub-request-response: ${{ needs.run-on-libp2p-gossipsub-request-response.result }}"
-          echo "run-on-libp2p-uds: ${{ needs.run-on-libp2p-uds.result }}"
-          echo "run-on-libp2p-whose-dependency-has-warnings: ${{ needs.run-on-libp2p-whose-dependency-has-warnings.result }}"
+          echo "run-on-pest-meta-feature-parity: ${{ needs.run-on-pest-meta-feature-parity.result }}"
+          echo "run-on-renamed-reexports: ${{ needs.run-on-renamed-reexports.result }}"
+          echo "run-on-reexported-generic-defaults: ${{ needs.run-on-reexported-generic-defaults.result }}"
           echo "run-on-core-graphics: ${{ needs.run-on-core-graphics.result }}"
           echo "run-on-bevy-core: ${{ needs.run-on-bevy-core.result }}"
           echo "run-on-bevy-gltf: ${{ needs.run-on-bevy-gltf.result }}"
@@ -72,20 +158,30 @@ jobs:
           echo "run-on-cargo-config-linux: ${{ needs.run-on-cargo-config-linux.result }}"
           echo "run-on-ref-slice-fork: ${{ needs.run-on-ref-slice-fork.result }}"
           echo "run-on-ref-slice-fork-windows: ${{ needs.run-on-ref-slice-fork-windows.result }}"
+          echo "run-on-bare-repository: ${{ needs.run-on-bare-repository.result }}"
           echo "run-on-tokio-explicit: ${{ needs.run-on-tokio-explicit.result }}"
           echo "run-on-tokio-implicit: ${{ needs.run-on-tokio-implicit.result }}"
           echo "run-on-perf-event-open-sys2: ${{ needs.run-on-perf-event-open-sys2.result }}"
           echo "fails-on-too-old-rustc: ${{ needs.fails-on-too-old-rustc.result }}"
           echo "broken-lint-reference-links: ${{ needs.broken-lint-reference-links.result }}"
+          echo "whitespace-hygiene: ${{ needs.whitespace-hygiene.result }}"
 
       # Fail this required job if any of its dependent jobs have failed.
       #
       # Do not attempt to consolidate these steps into one step, it won't work.
       # Multi-line `if` clauses are not evaluated properly: see the intermediate commits in
       # https://github.com/obi1kenobi/cargo-semver-checks/pull/405
+      - if: ${{ needs.build-script-policy.result != 'success' }}
+        run: exit 1
+      - if: ${{ needs.actionlint.result != 'success' }}
+        run: exit 1
+      - if: ${{ needs.zizmor.result != 'success' }}
+        run: exit 1
       - if: ${{ needs.lint.result != 'success' }}
         run: exit 1
       - if: ${{ needs.rust-tests.result != 'success' }}
+        run: exit 1
+      - if: ${{ needs.cargo-check-test-crates.result != 'success' }}
         run: exit 1
       - if: ${{ needs.check-test-crate-lockfiles.result != 'success' }}
         run: exit 1
@@ -93,15 +189,11 @@ jobs:
         run: exit 1
       - if: ${{ needs.cross-feature-caching.result != 'success' }}
         run: exit 1
-      - if: ${{ needs.run-on-rust-libp2p.result != 'success' }}
+      - if: ${{ needs.run-on-pest-meta-feature-parity.result != 'success' }}
         run: exit 1
-      - if: ${{ needs.run-on-libp2p-dcutr-relay.result != 'success' }}
+      - if: ${{ needs.run-on-renamed-reexports.result != 'success' }}
         run: exit 1
-      - if: ${{ needs.run-on-libp2p-gossipsub-request-response.result != 'success' }}
-        run: exit 1
-      - if: ${{ needs.run-on-libp2p-uds.result != 'success' }}
-        run: exit 1
-      - if: ${{ needs.run-on-libp2p-whose-dependency-has-warnings.result != 'success' }}
+      - if: ${{ needs.run-on-reexported-generic-defaults.result != 'success' }}
         run: exit 1
       - if: ${{ needs.run-on-core-graphics.result != 'success' }}
         run: exit 1
@@ -119,6 +211,8 @@ jobs:
         run: exit 1
       - if: ${{ needs.run-on-ref-slice-fork-windows.result != 'success' }}
         run: exit 1
+      - if: ${{ needs.run-on-bare-repository.result != 'success' }}
+        run: exit 1
       - if: ${{ needs.run-on-tokio-explicit.result != 'success' }}
         run: exit 1
       - if: ${{ needs.run-on-tokio-implicit.result != 'success' }}
@@ -129,25 +223,30 @@ jobs:
         run: exit 1
       - if: ${{ needs.broken-lint-reference-links.result != 'success' }}
         run: exit 1
+      - if: ${{ needs.whitespace-hygiene.result != 'success' }}
+        run: exit 1
 
   lint:
     name: Check lint and rustfmt
     runs-on: ubuntu-latest
+    needs:
+      - build-script-policy
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
 
       - name: Install rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: rustfmt, clippy
           cache: false
           rustflags: ""
+          build-warnings: ""
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: 'semver'
 
@@ -158,6 +257,8 @@ jobs:
       # Ideally, one day we'd be able to do something like "`--all-features` except feature X":
       # https://github.com/rust-lang/cargo/issues/3126
       - name: cargo clippy
+        # TODO: Once MSRV is 1.97, use the setup action's build-warnings: deny
+        # instead of -D warnings in this job.
         run: cargo clippy --manifest-path semver/Cargo.toml --workspace --all-targets --no-deps -- -D warnings --allow deprecated
 
       - name: cargo fmt
@@ -175,27 +276,32 @@ jobs:
       # https://github.com/rust-lang/cargo/issues/3126
       - name: cargo doc
         env:
+          # TODO: Once MSRV is 1.97, use the setup action's build-warnings: deny
+          # instead of -D warnings in this job.
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --manifest-path semver/Cargo.toml --workspace --no-deps --document-private-items
 
   cargo-check-test-crates:
     name: Ensure test crates pass "cargo check"
     runs-on: ubuntu-latest
+    needs:
+      - build-script-policy
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           toolchain: nightly  # Because we sometimes test unstable features.
           rustflags: ""
+          build-warnings: ""
           cache: false
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: 'semver'
 
@@ -206,19 +312,12 @@ jobs:
           #
           # Also don't complain about test crates that rely on:
           # - non-pub trait bounds (`private_bounds`)
-          # - `repr(C, i16)` and similar code (`conflicting_repr_hints`)
           #
           # TODO: Clean up warnings around `non_snake_case` and `non_upper_case_globals`.
           #       In the meantime, we suppress them as well since they clog the logs.
-          RUSTFLAGS: -A dead_code -A deprecated -A unused -A private_bounds -A conflicting_repr_hints -A non_snake_case -A non_upper_case_globals
+          RUSTFLAGS: -A dead_code -A deprecated -A unused -A private_bounds -A non_snake_case -A non_upper_case_globals
         # Exclude test crates that intentionally do not pass `cargo check`
         # in order to serve their test purpose.
-        #
-        # Also exclude test crates `enum_repr_int_added`, `enum_repr_int_changed`,
-        # `enum_repr_int_removed`, and `repr_c_removed` since the "conflicting representation hints"
-        # warning seems to have become a hard error on 1.90 stable.
-        # When 1.90 is the oldest Rust we support, remove the problematic code and
-        # remove the exclusion of those crates from this list.
         #
         # `xargs` stops immediately on exit 255, to make the problematic crate easier to spot.
         # We `cd` into the directory before running `cargo`, because crates like
@@ -229,10 +328,6 @@ jobs:
             -path 'test_crates/manifest_tests/workspace_baseline_compile_error/*' -prune -o \
             -path 'test_crates/manifest_tests/workspace_baseline_conditional_compile_error/*' -prune -o \
             -path 'test_crates/feature_flags_validation/*' -prune -o \
-            -path 'test_crates/enum_repr_int_added/*' -prune -o \
-            -path 'test_crates/enum_repr_int_changed/*' -prune -o \
-            -path 'test_crates/enum_repr_int_removed/*' -prune -o \
-            -path 'test_crates/repr_c_removed/*' -prune -o \
             -path 'test_crates/broken_rustdoc/*' -prune -o \
             -type f -name 'Cargo.toml' \
             -print0 | \
@@ -243,7 +338,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
@@ -263,94 +358,97 @@ jobs:
   rust-tests:
     name: Run tests
     runs-on: ubuntu-latest
+    needs:
+      - build-script-policy
     continue-on-error: ${{ matrix.experimental }}
     strategy:
       matrix:
         # IMPORTANT: When updating the versions here, make sure you also update
         #            the `fails-on-too-old-rustc` job and its error message to
         #            to account for the raised minimum required version.
-        #
-        #            Also make sure to update the MSRV in the cargo-semver-checks-action CI:
-        #            https://github.com/obi1kenobi/cargo-semver-checks-action/blob/main/.github/workflows/test-action.yml#L18
-        toolchain: ["1.91", "1.92", "1.93", "stable", "beta"]
+        toolchain: ["1.93", "1.94", "1.95", "1.96", "1.97", "1.98", "stable", "beta"]
         experimental: [false]
         include:
           - toolchain: "nightly"
             experimental: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          path: 'semver'
+
+      - name: Compute test rustdocs input hash
+        id: rustdoc-inputs
+        run: |
+          set -euo pipefail
+          hash="$(./scripts/hash_test_rustdocs_inputs.sh)"
+          if [[ ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Invalid test rustdocs input hash" >&2
+            exit 1
+          fi
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           toolchain: ${{ matrix.toolchain }}
           rustflags: ""
+          build-warnings: ""
           cache: false
 
       - name: restore test rustdocs
         id: cache-test-rustdocs
-        uses: actions/cache@v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: semver/localdata/test_data/
-          key: test-rustdocs-and-meta-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/test_crates/**/*.rs') }}
+          path: localdata/test_data/
+          key: test-rustdocs-and-meta-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.rustdoc-inputs.outputs.hash }}
 
       - name: Regenerate test data
         if: steps.cache-test-rustdocs.outputs.cache-hit != 'true'
-        run: |
-          cd semver
-          ./scripts/regenerate_test_rustdocs.sh +${{ matrix.toolchain }}
+        run: ./scripts/regenerate_test_rustdocs.sh +${{ matrix.toolchain }}
 
       - name: Fake rustdoc mtime on cache hit
         if: steps.cache-test-rustdocs.outputs.cache-hit == 'true'
-        run: |
-          cd semver
-          find localdata/test_data -exec touch {} \;
+        run: find localdata/test_data -exec touch {} \;
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: 'semver'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: compile
-        run: |
-          cd semver
-          cargo test --no-run
+        run: cargo test --no-run
 
       - name: test
-        run: |
-          cd semver
-          cargo test
+        run: cargo test
 
   build-binary:
     name: Build binary
     runs-on: ubuntu-latest
+    needs:
+      - build-script-policy
     env:
       CARGO_INCREMENTAL: 0
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
 
       - name: Install rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           rustflags: ""
+          build-warnings: ""
           cache: false
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: 'semver'
 
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: build
         run: |
@@ -364,7 +462,7 @@ jobs:
           mv target/debug/cargo-semver-checks ../bins/cargo-semver-checks
 
       - name: upload binary
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-semver-checks-linux
           path: bins/
@@ -380,29 +478,32 @@ jobs:
     # which would make whole CI last longer.
     name: Build binary (Windows)
     runs-on: windows-latest
+    needs:
+      - build-script-policy
     env:
       CARGO_INCREMENTAL: 0
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
 
       - name: Install rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           rustflags: ""
+          build-warnings: ""
           cache: false
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: 'semver'
 
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: build
         run: |
@@ -416,22 +517,22 @@ jobs:
           mv target\debug\cargo-semver-checks.exe ..\bins\cargo-semver-checks.exe
 
       - name: upload binary
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-semver-checks-windows
           path: bins\
 
   cross-version-caching:
-    # Ensure that cached rustdoc JSON files from an mismatched rustdoc version
-    # are transparently cleared and overwritten with the rustdoc version from the current toolchain.
+    # Ensure that cached rustdoc JSON files from a mismatched rustdoc version
+    # are not reused when running with the current toolchain.
     # Fixes: https://github.com/obi1kenobi/cargo-semver-checks/issues/415
     name: 'Caching across rustdoc versions'
     runs-on: ubuntu-latest
     needs:
       - build-binary
     env:
-      OLDER_RUST: "1.92"  # Rust 1.92 uses rustdoc v56
-      NEWER_RUST: "1.93"  # Rust 1.93 uses rustdoc v57
+      OLDER_RUST: "1.93"  # Rust 1.93 uses rustdoc v57
+      NEWER_RUST: "beta"  # Rust beta (currently 1.98) uses rustdoc v60
     steps:
       - name: Put env vars in outputs
         id: vars
@@ -440,25 +541,21 @@ jobs:
           echo "newer-rust=$NEWER_RUST" >> "$GITHUB_OUTPUT"
 
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
 
-      - name: Checkout rust-libp2p
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          repository: 'libp2p/rust-libp2p'
-          ref: '3371d7ceab242440216ae9ab99829631fa418f3b'
-          path: 'subject'
-
-      # rust-libp2p requires protobuf-compiler.
-      - name: Install protobuf-compiler
-        run: sudo apt install protobuf-compiler
+      - name: Download adler2
+        run: |
+          mkdir subject
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            https://static.crates.io/crates/adler2/adler2-2.0.1.crate \
+            --output adler2-2.0.1.crate
+          tar -xzf adler2-2.0.1.crate --strip-components=1 -C subject
 
       - name: Download binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cargo-semver-checks-linux
           path: bins/
@@ -467,44 +564,46 @@ jobs:
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           toolchain: ${{ steps.vars.outputs.older-rust }}
           rustflags: ""
+          build-warnings: ""
           cache: false
 
       - name: Restore rustdoc
         id: cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: cross-version-caching-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
+          key: cross-version-caching-adler2-2_0_1-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}
           path: subject/target/semver-checks/cache
 
       - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
-            subject/target/semver-checks/local-libp2p_core-0_37_0
+            subject/target/semver-checks/local-adler2-2_0_1
 
       # If we failed to set up the cache, set it up now.
       - name: Run semver-checks
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           cd semver
-          ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/core/Cargo.toml" --verbose
+          ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/Cargo.toml" --baseline-version 2.0.1 --default-features --verbose
 
       - name: Save rustdoc
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.cache.outputs.cache-hit != 'true'
         with:
-          key: cross-version-caching-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
+          key: cross-version-caching-adler2-2_0_1-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}
           path: subject/target/semver-checks/cache
 
       - name: Install newer rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           toolchain: ${{ steps.vars.outputs.newer-rust }}
           rustflags: ""
+          build-warnings: ""
           cache: false
 
       - name: Check with older rustdoc version cached
@@ -517,38 +616,73 @@ jobs:
 
           # Show what's in the cache.
           ls subject-new/target/semver-checks/cache/
-          EXPECTED_PREFIX='subject-new/target/semver-checks/cache/libp2p_core-0_37_0-default-ccce455725cbab73'
-          EXPECTED_CACHED_METADATA="${EXPECTED_PREFIX}.metadata.json"
-          EXPECTED_CACHED_RUSTDOC="${EXPECTED_PREFIX}.json"
+          mapfile -t OLD_CACHED_RUSTDOCS < <(find subject-new/target/semver-checks/cache \
+            -maxdepth 1 \
+            -name 'adler2-2_0_1-*.json' \
+            ! -name '*.metadata.json' \
+            | sort)
 
-          # Ensure the previous cached rustdoc and metadata files still exist.
-          [ -f "$EXPECTED_CACHED_METADATA" ] || { \
-            echo "could not find libp2p-core metadata cache file"; \
+          [ "${#OLD_CACHED_RUSTDOCS[@]}" -eq 1 ] || { \
+            echo "expected exactly one cached adler2 rustdoc file, found ${#OLD_CACHED_RUSTDOCS[@]}"; \
             exit 1;
           }
-          [ -f "$EXPECTED_CACHED_RUSTDOC" ] || { \
-            echo "could not find libp2p-core rustdoc cache file"; \
+          OLD_CACHED_RUSTDOC="${OLD_CACHED_RUSTDOCS[0]}"
+          OLD_CACHED_METADATA="${OLD_CACHED_RUSTDOC%.json}.metadata.json"
+
+          # Ensure the previous cached rustdoc and metadata files still exist.
+          [ -f "$OLD_CACHED_METADATA" ] || { \
+            echo "could not find adler2 metadata cache file"; \
+            exit 1;
+          }
+          [ -f "$OLD_CACHED_RUSTDOC" ] || { \
+            echo "could not find adler2 rustdoc cache file"; \
             exit 1;
           }
 
           OLD_RUSTDOC_VERSION=
-          OLD_RUSTDOC_VERSION=$(jq .format_version "$EXPECTED_CACHED_RUSTDOC")
+          OLD_RUSTDOC_VERSION=$(jq .format_version "$OLD_CACHED_RUSTDOC")
           export OLD_RUSTDOC_VERSION
 
           # Run cargo-semver-checks with the older cached file.
           # In a prior step, we installed a newer Rust, so we'll set that as the default
           # for cargo-semver-checks to invoke here.
           rustup override set "$NEWER_RUST"
-          bins/cargo-semver-checks semver-checks check-release --manifest-path="subject-new/core/Cargo.toml" --verbose
+          bins/cargo-semver-checks semver-checks check-release --manifest-path="subject-new/Cargo.toml" --baseline-version 2.0.1 --default-features --verbose
 
           # Show what's in the cache now.
           ls subject-new/target/semver-checks/cache/
+          mapfile -t CACHED_RUSTDOCS < <(find subject-new/target/semver-checks/cache \
+            -maxdepth 1 \
+            -name 'adler2-2_0_1-*.json' \
+            ! -name '*.metadata.json' \
+            | sort)
+
+          [ "${#CACHED_RUSTDOCS[@]}" -eq 2 ] || { \
+            echo "expected two cached adler2 rustdoc files, found ${#CACHED_RUSTDOCS[@]}"; \
+            exit 1;
+          }
+          NEW_CACHED_RUSTDOC=
+          for cached_rustdoc in "${CACHED_RUSTDOCS[@]}"; do
+            if [ "$cached_rustdoc" != "$OLD_CACHED_RUSTDOC" ]; then
+              NEW_CACHED_RUSTDOC="$cached_rustdoc"
+              break
+            fi
+          done
+          [ -n "$NEW_CACHED_RUSTDOC" ] || { \
+            echo "could not find new adler2 rustdoc cache file"; \
+            exit 1;
+          }
+          NEW_CACHED_METADATA="${NEW_CACHED_RUSTDOC%.json}.metadata.json"
+          [ -f "$NEW_CACHED_METADATA" ] || { \
+            echo "could not find new adler2 metadata cache file"; \
+            exit 1;
+          }
 
           NEW_RUSTDOC_VERSION=
-          NEW_RUSTDOC_VERSION=$(jq .format_version "$EXPECTED_CACHED_RUSTDOC")
+          NEW_RUSTDOC_VERSION=$(jq .format_version "$NEW_CACHED_RUSTDOC")
           export NEW_RUSTDOC_VERSION
 
-          # Ensure the cached rustdoc versions were indeed different before and after.
+          # Ensure the cached rustdoc versions differ across the separate cache entries.
           [ "$OLD_RUSTDOC_VERSION" != "$NEW_RUSTDOC_VERSION" ] || exit 1
 
   cross-feature-caching:
@@ -559,14 +693,14 @@ jobs:
       - build-binary
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
 
       # This is a fork of serde, modified to make feature `unstable` break semver.
       - name: Checkout fork of serde
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           repository: 'staniewzki/serde'
@@ -574,7 +708,7 @@ jobs:
           path: 'subject'
 
       - name: Download binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cargo-semver-checks-linux
           path: bins/
@@ -583,20 +717,21 @@ jobs:
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
           rustflags: ""
+          build-warnings: ""
 
       - name: Restore rustdoc
         id: cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: cross-feature-caching-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
+          key: cross-feature-caching-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}
           path: subject/target/semver-checks/cache
 
       - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             subject/target/semver-checks/local-serde-1_0_162
@@ -612,10 +747,10 @@ jobs:
       # Save the older rustdoc on cache miss. This must run *before* the cross-feature check,
       # since we don't want to save that rustdoc -- we're making sure it gets generated and used!
       - name: Save rustdoc
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.cache.outputs.cache-hit != 'true'
         with:
-          key: cross-feature-caching-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
+          key: cross-feature-caching-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}
           path: subject/target/semver-checks/cache
 
       # Run cargo-semver-checks, enabling feature `unstable` this time.
@@ -647,31 +782,24 @@ jobs:
           # Show what's in the cache.
           ls subject/target/semver-checks/cache/
 
-          # The previous cached rustdoc should continue to exist.
-          PREVIOUS_PREFIX='subject/target/semver-checks/cache/serde-1_0_162-default-5900ebf8bb9b9f8b'
-          PREVIOUS_RUSTDOC="${PREVIOUS_PREFIX}.json"
-          PREVIOUS_METADATA="${PREVIOUS_PREFIX}.metadata.json"
-          if [ ! -f "$PREVIOUS_RUSTDOC" ]; then
-            echo "Older rustdoc JSON not found in cache!"
-            exit 1
-          fi
-          if [ ! -f "$PREVIOUS_METADATA" ]; then
-            echo "Older metadata file not found in cache!"
-            exit 1
-          fi
+          # The previous cached rustdoc and the new feature-specific rustdoc should both exist.
+          mapfile -t CACHED_RUSTDOCS < <(find subject/target/semver-checks/cache \
+            -maxdepth 1 \
+            -name 'serde-1_0_162-*.json' \
+            ! -name '*.metadata.json' \
+            | sort)
 
-          # There should also be a new cached rustdoc file for the new feature settings.
-          NEW_PREFIX='subject/target/semver-checks/cache/serde-1_0_162-default-6999ae87ca463ab3'
-          NEW_RUSTDOC="${NEW_PREFIX}.json"
-          NEW_METADATA="${NEW_PREFIX}.metadata.json"
-          if [ ! -f "$NEW_RUSTDOC" ]; then
-            echo "New rustdoc JSON for new feature combo not found in cache!"
+          if [ "${#CACHED_RUSTDOCS[@]}" -ne 2 ]; then
+            echo "Expected exactly two serde rustdoc JSON cache files, found ${#CACHED_RUSTDOCS[@]}."
             exit 1
           fi
-          if [ ! -f "$NEW_METADATA" ]; then
-            echo "New metadata file for new feature combo not found in cache!"
-            exit 1
-          fi
+          for cached_rustdoc in "${CACHED_RUSTDOCS[@]}"; do
+            metadata="${cached_rustdoc%.json}.metadata.json"
+            if [ ! -f "$metadata" ]; then
+              echo "Metadata file not found in cache for $cached_rustdoc!"
+              exit 1
+            fi
+          done
 
       - name: Cleanup
         run: |
@@ -679,45 +807,43 @@ jobs:
           rm output
           rm -f unexpectedly_did_not_fail
 
-  run-on-rust-libp2p:
+  run-on-pest-meta-feature-parity:
     # Run cargo-semver-checks on a crate with no semver violations,
-    # to make sure there are no false-positives.
+    # to make sure there are no false-positives when checking a crates.io
+    # baseline with an explicit feature set.
     #
     # cargo-semver-checks previously reported a false-positive here,
     # since an enum variant in the crate was included by a feature:
     # https://github.com/obi1kenobi/cargo-semver-checks/issues/147
-    name: 'Semver: libp2p-core 0.37.0'
+    name: 'Semver: pest_meta 2.8.6 with explicit features'
     runs-on: ubuntu-latest
     needs:
       - build-binary
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
 
-      - name: Checkout rust-libp2p
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          repository: 'libp2p/rust-libp2p'
-          ref: '3371d7ceab242440216ae9ab99829631fa418f3b'
-          path: 'subject'
+      - name: Download pest_meta
+        run: |
+          mkdir subject
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            https://static.crates.io/crates/pest_meta/pest_meta-2.8.6.crate \
+            --output pest_meta-2.8.6.crate
+          tar -xzf pest_meta-2.8.6.crate --strip-components=1 -C subject
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
           rustflags: ""
-
-      # rust-libp2p requires protobuf-compiler.
-      - name: Install protobuf-compiler
-        run: sudo apt install protobuf-compiler
+          build-warnings: ""
 
       - name: Download binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cargo-semver-checks-linux
           path: bins/
@@ -726,21 +852,21 @@ jobs:
 
       - name: Restore rustdoc
         id: cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
           path: subject/target/semver-checks/cache
 
       - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
-            subject/target/semver-checks/local-libp2p_core-0_37_0
+            subject/target/semver-checks/local-pest_meta-2_8_6
 
       - name: Run semver-checks
         run: |
           cd semver
-          ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/core/Cargo.toml" --verbose
+          ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/Cargo.toml" --baseline-version 2.8.6 --only-explicit-features --features grammar-extras --verbose
 
       # Test passing package name explicitly.
       # It was previously possible to make the command above work while the one here failed.
@@ -748,231 +874,96 @@ jobs:
       - name: Run semver-checks (alternative command)
         run: |
           cd semver
-          ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/core/Cargo.toml" --package="libp2p-core" --verbose
+          ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/Cargo.toml" --package="pest_meta" --baseline-version 2.8.6 --only-explicit-features --features grammar-extras --verbose
 
       - name: Save rustdoc
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.cache.outputs.cache-hit != 'true'
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
           path: subject/target/semver-checks/cache
 
-  run-on-libp2p-dcutr-relay:
+  run-on-renamed-reexports:
     # Run cargo-semver-checks on a crate with no semver violations,
-    # to make sure there are no false-positives.
+    # to make sure there are no false-positives when matching public items
+    # that are renamed re-exports of same-named enums from different modules.
     #
     # cargo-semver-checks previously reported false-positives here
     # due to renaming re-exports causing confusion about which types match each other:
     # https://github.com/obi1kenobi/cargo-semver-checks/issues/202
     # https://github.com/libp2p/rust-libp2p/pull/2647#issuecomment-1340254920
-    name: 'Semver: libp2p-dcutr 1.62.0 and libp2p-relay 0.14.0'
+    name: 'Semver: renamed re-exports with same-named enums'
     runs-on: ubuntu-latest
     needs:
       - build-binary
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
 
-      - name: Checkout rust-libp2p
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          repository: 'libp2p/rust-libp2p'
-          ref: 'be0b62a78fe9d72811b9eda742137cc8ddc4da35'
-          path: 'subject'
-
       - name: Install rust
-        id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
           rustflags: ""
-
-      # rust-libp2p requires protobuf-compiler.
-      - name: Install protobuf-compiler
-        run: sudo apt install protobuf-compiler
+          build-warnings: ""
 
       - name: Download binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cargo-semver-checks-linux
           path: bins/
       - name: Make binary executable
         run: chmod +x bins/cargo-semver-checks
 
-      - name: Restore rustdoc
-        id: cache
-        uses: actions/cache/restore@v5
-        with:
-          key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
-          path: subject/target/semver-checks/cache
-
-      - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            subject/target/semver-checks/local-libp2p_dcutr-1_62_0
-            subject/target/semver-checks/local-libp2p_relay-0_14_0
-
-      - name: Run semver-checks on libp2p-dcutr
+      - name: Run semver-checks
         run: |
           cd semver
-          ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/protocols/dcutr/Cargo.toml" --verbose
+          ../bins/cargo-semver-checks semver-checks check-release \
+            --manifest-path="test_crates/ci_regressions/renamed_reexport_same_named_enums/new/Cargo.toml" \
+            --baseline-root="test_crates/ci_regressions/renamed_reexport_same_named_enums/old" \
+            --verbose
 
-      - name: Run semver-checks on libp2p-relay
-        run: |
-          cd semver
-          ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/protocols/relay/Cargo.toml" --verbose
-
-      - name: Save rustdoc
-        uses: actions/cache/save@v5
-        if: steps.cache.outputs.cache-hit != 'true'
-        with:
-          key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
-          path: subject/target/semver-checks/cache
-
-  run-on-libp2p-gossipsub-request-response:
-    # Run cargo-semver-checks on two crates that used to trip an assert and cause a crash,
+  run-on-reexported-generic-defaults:
+    # Run cargo-semver-checks on a crate that used to trip an assert and cause a crash,
     # due to re-exports that omit generic parameters because the underlying generic type supplies
     # default values for those generics.
     # https://github.com/libp2p/rust-libp2p/pull/3401#issuecomment-1409381365
-    name: 'Semver: libp2p-gossipsub ~0.44.0 + libp2p-request-response ~0.24.0'
+    name: 'Semver: re-exported generic defaults'
     runs-on: ubuntu-latest
     needs:
       - build-binary
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
 
-      - name: Checkout rust-libp2p
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          repository: 'libp2p/rust-libp2p'
-          ref: '8b8dc26e0601433f5675430b29b50687a37d4cd8'
-          path: 'subject'
-
       - name: Install rust
-        id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
           rustflags: ""
-
-      # rust-libp2p requires protobuf-compiler.
-      - name: Install protobuf-compiler
-        run: sudo apt install protobuf-compiler
+          build-warnings: ""
 
       - name: Download binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cargo-semver-checks-linux
           path: bins/
       - name: Make binary executable
         run: chmod +x bins/cargo-semver-checks
 
-      - name: Restore rustdoc
-        id: cache
-        uses: actions/cache/restore@v5
-        with:
-          key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
-          path: subject/target/semver-checks/cache
-
-      - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            subject/target/semver-checks/local-libp2p_gossipsub-0_44_0
-            subject/target/semver-checks/local-libp2p_request_response-0_23_0
-
-      - name: Run semver-checks on libp2p-gossipsub
+      - name: Run semver-checks
         run: |
           cd semver
-          ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/protocols/gossipsub/Cargo.toml" --baseline-version 0.43.0 --verbose
-
-      - name: Run semver-checks on libp2p-request-response
-        run: |
-          cd semver
-          ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/protocols/request-response/Cargo.toml" --baseline-version 0.23.0 --verbose
-
-      - name: Save rustdoc
-        uses: actions/cache/save@v5
-        if: steps.cache.outputs.cache-hit != 'true'
-        with:
-          key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
-          path: subject/target/semver-checks/cache
-
-  run-on-libp2p-uds:
-    # Run cargo-semver-checks on a crate that has dependencies in a custom target
-    # https://github.com/obi1kenobi/cargo-semver-checks/issues/369
-    name: 'Semver: libp2p-uds 0.37.0'
-    runs-on: ubuntu-latest
-    needs:
-      - build-binary
-    steps:
-      - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          path: 'semver'
-
-      - name: Checkout rust-libp2p
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          repository: 'libp2p/rust-libp2p'
-          ref: '5b4eab7bafe6cba8fea6c806027ea680662b7cc6'
-          path: 'subject'
-
-      - name: Install rust
-        id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache: false
-          rustflags: ""
-
-      # rust-libp2p requires protobuf-compiler.
-      - name: Install protobuf-compiler
-        run: sudo apt install protobuf-compiler
-
-      - name: Download binary
-        uses: actions/download-artifact@v8
-        with:
-          name: cargo-semver-checks-linux
-          path: bins/
-      - name: Make binary executable
-        run: chmod +x bins/cargo-semver-checks
-
-      - name: Restore rustdoc
-        id: cache
-        uses: actions/cache/restore@v5
-        with:
-          key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
-          path: subject/target/semver-checks/cache
-
-      - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            subject/target/semver-checks/local-libp2p_uds-0_37_0
-
-      - name: Run semver-checks on libp2p-uds
-        run: |
-          cd semver
-          ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/transports/uds/Cargo.toml" --verbose
-
-      - name: Save rustdoc
-        uses: actions/cache/save@v5
-        if: steps.cache.outputs.cache-hit != 'true'
-        with:
-          key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
-          path: subject/target/semver-checks/cache
+          ../bins/cargo-semver-checks semver-checks check-release \
+            --manifest-path="test_crates/ci_regressions/reexported_generic_defaults/new/Cargo.toml" \
+            --baseline-root="test_crates/ci_regressions/reexported_generic_defaults/old" \
+            --verbose
 
   run-on-core-graphics:
     # Run cargo-semver-checks on a crate with no semver violations,
@@ -983,15 +974,17 @@ jobs:
     # https://github.com/obi1kenobi/cargo-semver-checks/issues/193
     name: 'Semver: core-graphics'
     runs-on: macos-latest
+    needs:
+      - build-script-policy
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
 
       - name: Checkout rust-libp2p
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           repository: 'servo/core-foundation-rs'
@@ -1000,14 +993,15 @@ jobs:
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
           rustflags: ""
+          build-warnings: ""
 
       # This job runs on macOS, not Linux like the rest.
       # It should save its cache, because no other job will save it in its place.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: 'semver'
           workspaces: |
@@ -1016,7 +1010,7 @@ jobs:
 
       - name: Restore rustdoc
         id: cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
           path: subject/target/semver-checks/cache
@@ -1027,7 +1021,7 @@ jobs:
           cargo run semver-checks check-release --manifest-path="../subject/core-graphics/Cargo.toml" --verbose
 
       - name: Save rustdoc
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.cache.outputs.cache-hit != 'true'
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
@@ -1043,28 +1037,29 @@ jobs:
       - build-binary
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
 
       - name: Checkout bevy
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           repository: 'bevyengine/bevy'
-          ref: 'v0.9.0'
+          ref: '920543c824735dc1df6f4a59e7036e653dd5a553' # v0.9.0
           path: 'subject'
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
           rustflags: ""
+          build-warnings: ""
 
       - name: Download binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cargo-semver-checks-linux
           path: bins/
@@ -1073,13 +1068,13 @@ jobs:
 
       - name: Restore rustdoc
         id: cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
           path: subject/target/semver-checks/cache
 
       - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             subject/target/semver-checks/local-bevy_core-0_9_0
@@ -1090,7 +1085,7 @@ jobs:
           ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/crates/bevy_core/Cargo.toml" --verbose
 
       - name: Save rustdoc
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.cache.outputs.cache-hit != 'true'
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
@@ -1106,28 +1101,29 @@ jobs:
       - build-binary
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
 
       - name: Checkout bevy
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           repository: 'bevyengine/bevy'
-          ref: 'v0.9.1'
+          ref: '5718a7e74cc9b93d1d0bed9123548222123151b3' # v0.9.1
           path: 'subject'
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
           rustflags: ""
+          build-warnings: ""
 
       - name: Download binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cargo-semver-checks-linux
           path: bins/
@@ -1136,13 +1132,13 @@ jobs:
 
       - name: Restore rustdoc
         id: cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
           path: subject/target/semver-checks/cache
 
       - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             subject/target/semver-checks/local-bevy_gltf-0_9_1
@@ -1153,7 +1149,7 @@ jobs:
           ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/crates/bevy_gltf/Cargo.toml" --baseline-version 0.9.0 --verbose
 
       - name: Save rustdoc
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.cache.outputs.cache-hit != 'true'
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
@@ -1168,28 +1164,29 @@ jobs:
       - build-binary
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
 
       - name: Checkout sqllogictest
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           repository: 'risinglightdb/sqllogictest-rs'
-          ref: 'v0.13.0'
+          ref: 'ad46a4f7145b4cc7b94f8c48591527f5defeb01e' # v0.13.0
           path: 'subject'
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
           rustflags: ""
+          build-warnings: ""
 
       - name: Download binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cargo-semver-checks-linux
           path: bins/
@@ -1198,13 +1195,13 @@ jobs:
 
       - name: Restore rustdoc
         id: cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
           path: subject/target/semver-checks/cache
 
       - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             subject/target/semver-checks/local-sqllogictest-0_13_0
@@ -1220,7 +1217,7 @@ jobs:
           ../bins/cargo-semver-checks semver-checks check-release --manifest-path ../subject/sqllogictest/Cargo.toml --verbose
 
       - name: Save rustdoc
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.cache.outputs.cache-hit != 'true'
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
@@ -1231,11 +1228,14 @@ jobs:
     # https://github.com/obi1kenobi/cargo-semver-checks/issues/380
     name: 'Semver: tokio ~v1.25.0 (explicit)'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
     needs:
       - build-binary
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
@@ -1259,7 +1259,7 @@ jobs:
           fi
 
       # - name: Checkout tokio
-      #   uses: actions/checkout@v6
+      #   uses: actions/checkout@v7
       #   with:
       #     persist-credentials: false
       #     repository: 'tokio-rs/tokio'
@@ -1285,7 +1285,7 @@ jobs:
 
       # - name: Restore binary
       #   id: cache-binary
-      #   uses: actions/cache/restore@v5
+      #   uses: actions/cache/restore@v6
       #   with:
       #     path: bins/
       #     key: bins-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1293,7 +1293,7 @@ jobs:
 
       # - name: Restore rustdoc
       #   id: cache
-      #   uses: actions/cache/restore@v5
+      #   uses: actions/cache/restore@v6
       #   with:
       #     key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
       #     path: subject/target/semver-checks/cache
@@ -1316,7 +1316,7 @@ jobs:
       #     ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/Cargo.toml" --release-type minor --exclude examples --exclude stress-test --exclude tests-build --exclude tests-integration --verbose
 
       # - name: Save rustdoc
-      #   uses: actions/cache/save@v5
+      #   uses: actions/cache/save@v6
       #   if: steps.cache.outputs.cache-hit != 'true'
       #   with:
       #     key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
@@ -1327,11 +1327,14 @@ jobs:
     # https://github.com/obi1kenobi/cargo-semver-checks/issues/380
     name: 'Semver: tokio ~v1.25.0 (implicit)'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
     needs:
       - build-binary
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
@@ -1355,7 +1358,7 @@ jobs:
 
 
       # - name: Checkout tokio
-      #   uses: actions/checkout@v6
+      #   uses: actions/checkout@v7
       #   with:
       #     persist-credentials: false
       #     repository: 'tokio-rs/tokio'
@@ -1381,7 +1384,7 @@ jobs:
 
       # - name: Restore binary
       #   id: cache-binary
-      #   uses: actions/cache/restore@v5
+      #   uses: actions/cache/restore@v6
       #   with:
       #     path: bins/
       #     key: bins-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1389,7 +1392,7 @@ jobs:
 
       # - name: Restore rustdoc
       #   id: cache
-      #   uses: actions/cache/restore@v5
+      #   uses: actions/cache/restore@v6
       #   with:
       #     key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
       #     path: subject/target/semver-checks/cache
@@ -1402,7 +1405,7 @@ jobs:
       #     ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/Cargo.toml" --release-type minor --verbose
 
       # - name: Save rustdoc
-      #   uses: actions/cache/save@v5
+      #   uses: actions/cache/save@v6
       #   if: steps.cache.outputs.cache-hit != 'true'
       #   with:
       #     key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
@@ -1418,36 +1421,37 @@ jobs:
       - build-binary
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
 
       - name: Checkout clap v3.2.0
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           repository: 'clap-rs/clap'
-          ref: 'v3.2.0'
+          ref: '4e56acffcebd6f9b37f0714f3d3b69beacb564b6' # v3.2.0
           path: 'subject-current'
 
       - name: Checkout clap v3.1.18
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           repository: 'clap-rs/clap'
-          ref: 'v3.1.18'
+          ref: '524e36cf1a67ee6a447d3615a70b065d2b4f5e60' # v3.1.18
           path: 'subject-baseline'
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
           rustflags: ""
+          build-warnings: ""
 
       - name: Download binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cargo-semver-checks-linux
           path: bins/
@@ -1456,13 +1460,13 @@ jobs:
 
       - name: Restore rustdoc
         id: cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
           path: subject-current/target/semver-checks/cache
 
       - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             subject-current/target/semver-checks/local-clap-3_2_0/
@@ -1522,7 +1526,7 @@ jobs:
           diff <(echo "$RESULT") <(echo "$EXPECTED")
 
       - name: Save rustdoc
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.cache.outputs.cache-hit != 'true'
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
@@ -1537,21 +1541,21 @@ jobs:
       - build-binary
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: true
+          persist-credentials: false
           path: "semver"
 
       - name: Checkout ref-slice fork major change
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # NOTE: We cannot checkout a bare repository with the actions/checkout action
           # (https://github.com/actions/checkout/issues/603), so we checkout a "normal" version
           # and clone the local checkout into a bare repository.
           fetch-depth: 0
           persist-credentials: false
-          repository: "mgr0dzicki/cargo-semver-action-ref-slice"
-          ref: "major_change"
+          repository: "obi1kenobi/cargo-semver-action-ref-slice"
+          ref: "4d64380252c8fbda023cca58406fa40a27ad1177"  # branch major_change
           path: "subject-checkout"
 
       - name: Setup bare repository worktree
@@ -1559,18 +1563,20 @@ jobs:
           set -euo pipefail
           git clone --bare subject-checkout subject-bare
           mkdir subject
-          git --git-dir subject-bare --work-tree subject checkout major_change .
+          revision="$(git -C subject-checkout rev-parse --verify 'HEAD^{commit}')"
+          git --git-dir subject-bare --work-tree subject checkout "$revision" .
           test ! -e subject/.git
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
           rustflags: ""
+          build-warnings: ""
 
       - name: Download binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cargo-semver-checks-linux
           path: bins/
@@ -1579,13 +1585,13 @@ jobs:
 
       - name: Restore rustdoc
         id: cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
           path: subject/target/semver-checks/cache
 
       - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             subject/target/semver-checks/git-v1_2_1/
@@ -1612,7 +1618,7 @@ jobs:
           diff <(echo "$RESULT") <(echo "$EXPECTED")
 
       - name: Save rustdoc
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.cache.outputs.cache-hit != 'true'
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
@@ -1627,7 +1633,7 @@ jobs:
       - build-binary
     steps:
       - name: Checkout cargo-config testcases
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           repository: 'obi1kenobi/c-s-c-testcase-cargo-config-toml'
@@ -1635,13 +1641,14 @@ jobs:
           path: 'semver'
 
       - name: Install rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
           rustflags: ""
+          build-warnings: ""
 
       - name: Download binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cargo-semver-checks-linux
           path: bins/
@@ -1849,30 +1856,31 @@ jobs:
       - build-binary
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: true
+          persist-credentials: false
           path: 'semver'
 
       - name: Checkout ref-slice fork semver break
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          repository: 'mgr0dzicki/cargo-semver-action-ref-slice'
+          repository: 'obi1kenobi/cargo-semver-action-ref-slice'
           ref: '4d64380252c8fbda023cca58406fa40a27ad1177'  # branch major_change
           path: 'subject'
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         env:
           CARGO_REGISTRIES_CRATES_IO_PROTOCOL: ${{ matrix.protocol }}
         with:
           cache: false
           rustflags: ""
+          build-warnings: ""
 
       - name: Download binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cargo-semver-checks-linux
           path: bins/
@@ -1881,13 +1889,13 @@ jobs:
 
       - name: Restore rustdoc
         id: cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
           path: subject/target/semver-checks/cache
 
       - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             subject/target/semver-checks/local-ref_slice-1_2_1/
@@ -1931,7 +1939,7 @@ jobs:
           rm -f unexpectedly_did_not_fail
 
       - name: Save rustdoc
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.cache.outputs.cache-hit != 'true'
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
@@ -1951,41 +1959,42 @@ jobs:
       - build-binary-windows
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: true
+          persist-credentials: false
           path: semver
 
       - name: Checkout ref-slice fork semver break
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          repository: 'mgr0dzicki/cargo-semver-action-ref-slice'
+          repository: 'obi1kenobi/cargo-semver-action-ref-slice'
           ref: '4d64380252c8fbda023cca58406fa40a27ad1177'  # branch major_change
           path: 'subject'
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
           rustflags: ""
+          build-warnings: ""
 
       - name: Download binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cargo-semver-checks-windows
           path: bins\
 
       - name: Restore rustdoc
         id: cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver\**\Cargo.lock') }}-${{ github.job }}-rustdoc
           path: subject\target\semver-checks\cache
 
       - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             subject\target\semver-checks\local-ref_slice-1_2_1\
@@ -2030,81 +2039,11 @@ jobs:
           rm output
 
       - name: Save rustdoc
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.cache.outputs.cache-hit != 'true'
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver\**\Cargo.lock') }}-${{ github.job }}-rustdoc
           path: subject\target\semver-checks\cache
-
-  run-on-libp2p-whose-dependency-has-warnings:
-    # cargo-semver-checks failed to generate rustdoc JSON for a commit near libp2p v0.53.1 because:
-    # - RUSTFLAGS was set to "-Dwarning" by default by a GitHub Action
-    # - libp2p has a dependency (libp2p-yamux) whose dependency (yamux) released a newer version,
-    #   which deprecated an item that libp2p-yamux uses
-    # - cargo-semver-checks added "--cap-lints" to RUSTDOCFLAGS but not RUSTFLAGS
-    # - generating rustdoc JSON for libp2p involves a rustc check of its dependency, and that
-    #   check obeys RUSTFLAGS, not RUSTDOCFLAGS
-    #
-    # https://github.com/obi1kenobi/cargo-semver-checks/issues/589
-    name: 'Semver: dependency has warnings with "-Dwarnings" (libp2p v0.53.1)'
-    runs-on: ubuntu-latest
-    needs:
-      - build-binary
-    steps:
-      - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          path: 'semver'
-
-      - name: Checkout libp2p
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          repository: 'libp2p/rust-libp2p'
-          ref: '4759ba8244242628164b7ec9e7dc99d67269e39f'
-          path: 'subject'
-
-      - name: Install rust
-        id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache: false
-          rustflags: "-Dwarnings"  # set explicitly, to ensure we trigger the bug described above
-
-      - name: Download binary
-        uses: actions/download-artifact@v8
-        with:
-          name: cargo-semver-checks-linux
-          path: bins/
-      - name: Make binary executable
-        run: chmod +x bins/cargo-semver-checks
-
-      - name: Restore rustdoc
-        id: cache
-        uses: actions/cache/restore@v5
-        with:
-          key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
-          path: subject/target/semver-checks/cache
-
-      - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            subject/target/semver-checks/local-libp2p-0_53_1
-
-      - name: Run semver-checks
-        run: |
-          cd semver
-          ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/Cargo.toml" -p libp2p --verbose
-
-      - name: Save rustdoc
-        uses: actions/cache/save@v5
-        if: steps.cache.outputs.cache-hit != 'true'
-        with:
-          key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
-          path: subject/target/semver-checks/cache
-
 
   run-on-perf-event-open-sys2:
     # cargo-semver-checks failed to find the generated rustdoc JSON
@@ -2116,13 +2055,13 @@ jobs:
       - build-binary
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
 
       - name: Checkout phantomical/perf-event
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           repository: 'phantomical/perf-event'
@@ -2131,13 +2070,14 @@ jobs:
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
           rustflags: ""
+          build-warnings: ""
 
       - name: Download binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cargo-semver-checks-linux
           path: bins/
@@ -2146,13 +2086,13 @@ jobs:
 
       - name: Restore rustdoc
         id: cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
           path: subject/target/semver-checks/cache
 
       - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             subject/target/semver-checks/local-perf-event-open-sys2-5_0_0
@@ -2163,7 +2103,7 @@ jobs:
           ../bins/cargo-semver-checks semver-checks check-release --manifest-path="../subject/perf-event-open-sys/Cargo.toml" --baseline-version 5.0.0 --verbose
 
       - name: Save rustdoc
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.cache.outputs.cache-hit != 'true'
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
@@ -2180,14 +2120,14 @@ jobs:
       - build-binary
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
 
       # rust-fnv is very lightweight and quite stable.
       - name: Checkout rust-fnv
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           repository: "servo/rust-fnv"
@@ -2196,14 +2136,15 @@ jobs:
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          toolchain: "1.90"
+          toolchain: "1.92"
           rustflags: ""
+          build-warnings: ""
           cache: false
 
       - name: Download binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cargo-semver-checks-linux
           path: bins/
@@ -2212,13 +2153,13 @@ jobs:
 
       - name: Restore rustdoc
         id: cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
           path: subject/target/semver-checks/cache
 
       - name: Restore cargo index and rustdoc target dir
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             subject/target/semver-checks/local-fnv-1_0_7/
@@ -2241,7 +2182,7 @@ jobs:
       - name: Check output
         run: |
           cd semver
-          EXPECTED="$(echo -e "error: rustc version is not high enough: >=1.91.0 needed, got 1.90.0")"
+          EXPECTED="$(echo -e "error: rustc version is not high enough: >=1.93.0 needed, got 1.92.0")"
           RESULT="$(grep 'error: rustc version' output)"
           diff <(echo "$RESULT") <(echo "$EXPECTED")
 
@@ -2252,7 +2193,7 @@ jobs:
           rm -f unexpectedly_did_not_fail
 
       - name: Save rustdoc
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.cache.outputs.cache-hit != 'true'
         with:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('semver/**/Cargo.lock') }}-${{ github.job }}-rustdoc
@@ -2263,7 +2204,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout cargo-semver-checks
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: 'semver'
@@ -2281,6 +2222,135 @@ jobs:
           cd semver
           ./scripts/check_reference_links.sh
 
+  # This job must succeed as a no-op outside pull requests. `ci-everything` depends
+  # on it. GitHub propagates a skipped job through the entire `needs` chain,
+  # even when an intermediate job uses `always()`. Keep the PR-only conditions
+  # on the individual steps instead of on the job.
+  whitespace-hygiene:
+    name: Check trailing whitespace and final newlines
+    runs-on: ubuntu-latest
+    steps:
+      - name: No-op outside pull requests
+        if: github.event_name != 'pull_request'
+        run: echo 'Whitespace hygiene is only checked on pull requests.'
+
+      - name: Checkout cargo-semver-checks
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+          path: 'semver'
+
+      - name: Check changed files
+        if: github.event_name == 'pull_request'
+        working-directory: semver
+        run: |
+          export LC_ALL=C
+
+          had_error=0
+          header_printed=0
+          diff_check_output="$(mktemp)"
+          changed_files_list="$(mktemp)"
+          diff_check_report="$(mktemp)"
+          trap 'rm -f "$diff_check_output" "$changed_files_list" "$diff_check_report"' EXIT
+
+          if ! base_ref="$(git rev-parse --verify HEAD^1)"; then
+            printf '%s\n' \
+              'Sorry, the whitespace check could not determine the base commit for this PR.' \
+              'Please try rerunning CI. If it keeps failing, ask a maintainer to take a look.'
+            exit 1
+          fi
+
+          diff_check_status=0
+
+          git diff --check --no-color "$base_ref"..HEAD -- >"$diff_check_output" 2>&1 || diff_check_status=$?
+          if [ "$diff_check_status" -ne 0 ] && [ "$diff_check_status" -ne 2 ]; then
+            printf '%s\n' \
+              'Sorry, the whitespace check could not compare this PR against its base commit.' \
+              'Please try rerunning CI. If it keeps failing, ask a maintainer to take a look.'
+            cat "$diff_check_output"
+            exit "$diff_check_status"
+          fi
+
+          if ! git diff --name-only -z --diff-filter=ACMR "$base_ref"..HEAD -- >"$changed_files_list"; then
+            printf '%s\n' \
+              'Sorry, the whitespace check could not list the files changed in this PR.' \
+              'Please try rerunning CI. If it keeps failing, ask a maintainer to take a look.'
+            exit 1
+          fi
+
+          print_header() {
+            if [ "$header_printed" -eq 0 ]; then
+              printf '%s\n' \
+                'We found a few whitespace issues in this PR.' \
+                'Please fix the reported whitespace issues and make sure each affected text file ends with a single newline.' \
+                ''
+              header_printed=1
+            fi
+          }
+
+          # Only check lines introduced by this PR for whitespace issues that
+          # `git diff --check` reports, so unrelated pre-existing whitespace in
+          # touched files does not fail CI. Lines that consist only of spaces
+          # are allowed, so suppress the matching trailing-whitespace finding.
+          awk '
+            function flush_pending() {
+              if (pending != "") {
+                print pending
+                pending = ""
+              }
+            }
+
+            /^[^:]+:[0-9][0-9]*: / {
+              flush_pending()
+              pending = $0
+              next
+            }
+
+            pending ~ /: trailing whitespace\.$/ && /^\+[ ]+$/ {
+              pending = ""
+            }
+
+            END { flush_pending() }
+          ' \
+            "$diff_check_output" >"$diff_check_report"
+
+          if [ -s "$diff_check_report" ]; then
+            had_error=1
+            print_header
+            cat "$diff_check_report"
+          fi
+
+          # Missing final newlines are an end-of-file property, so check changed text files.
+          while IFS= read -r -d '' file; do
+            [ -f "$file" ] || continue
+            grep -Iq . "$file" || continue
+
+            if [ -s "$file" ]; then
+              last_byte="$(tail -c 1 -- "$file" | od -An -t x1 | tr -d '[:space:]')"
+              if [ "$last_byte" != '0a' ]; then
+                had_error=1
+                print_header
+                line_number="$(awk 'END { print NR }' "$file")"
+                printf '%s:%s: file does not end with a trailing newline\n' "$file" "$line_number"
+              fi
+            fi
+          done <"$changed_files_list"
+
+          if [ "$had_error" -ne 0 ]; then
+            printf '%s\n' \
+              '' \
+              'Most editors can fix this automatically.' \
+              'In VSCode-based editors, add these settings:' \
+              '    "files.trimFinalNewlines": true,' \
+              '    "files.trimTrailingWhitespace": true,' \
+              '    "files.insertFinalNewline": true,'
+            exit 1
+          fi
+
+          echo 'No whitespace hygiene issues were found in changed text files.'
+
   init-release:
     name: Run the release workflow
     needs:
@@ -2288,31 +2358,37 @@ jobs:
       - ci-everything
       - pre-publish-checks
     if: needs.should-publish.outputs.is_new_version == 'yes' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+      id-token: write
     uses: ./.github/workflows/release.yml
     with:
       publish-tag: ${{ needs.should-publish.outputs.publish-tag }}
-    secrets:
-      TAGGER_GITHUB_TOKEN: ${{ secrets.TAGGER_GITHUB_TOKEN }}
 
   should-publish:
     name: Check if version changed
     runs-on: ubuntu-latest
+    needs:
+      - build-script-policy
     outputs:
       is_new_version: ${{ steps.check.outputs.is_new_version }}
       publish-tag: ${{ steps.tag.outputs.tag }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
+          # TODO: Once MSRV is 1.97, use build-warnings: deny instead of -D warnings.
+          rustflags: "-D warnings"
+          build-warnings: ""
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - id: check
         run: |
@@ -2344,12 +2420,12 @@ jobs:
     if: needs.should-publish.outputs.is_new_version == 'yes'
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Check semver
-        uses: obi1kenobi/cargo-semver-checks-action@v2
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
         with:
           # Ensure we include all new non-default features here explicitly, except for
           # pass-through mutually-exclusive features from our dependencies such as:
@@ -2362,30 +2438,39 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        toolchain: ["1.91", "1.92", "1.93", "stable"]
+        toolchain: ["1.93", "1.94", "1.95", "1.96", "1.97", "1.98", "stable"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Compute test rustdocs input hash
+        id: rustdoc-inputs
+        run: |
+          set -euo pipefail
+          hash="$(./scripts/hash_test_rustdocs_inputs.sh)"
+          if [[ ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Invalid test rustdocs input hash" >&2
+            exit 1
+          fi
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+
       - name: Install rust
         id: toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           toolchain: ${{ matrix.toolchain }}
+          rustflags: ""
+          build-warnings: ""
           cache: false
 
       - name: Restore test rustdocs
         id: cache-test-rustdocs
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: localdata/test_data/
-          key: test-rustdocs-and-meta-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('test_crates/**/*.rs') }}
-
-      - name: Compute hash
-        id: hash
-        run: echo "hash=$(./scripts/hash_test_rustdocs_inputs.sh)" >> "$GITHUB_OUTPUT"
+          key: test-rustdocs-and-meta-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.rustdoc-inputs.outputs.hash }}
 
       - name: Regenerate test rustdocs
         if: steps.cache-test-rustdocs.outputs.cache-hit != 'true'
@@ -2394,13 +2479,13 @@ jobs:
       - name: Compute artifact name
         id: artifact
         run: |
-          HASH="${{ steps.hash.outputs.hash }}"
+          HASH="${{ steps.rustdoc-inputs.outputs.hash }}"
           TRIPLE="$(rustc -vV | grep '^host:' | awk '{print $2}')"
           VERSION="$(rustc --version | awk '{print $2}')"
           echo "name=test-rustdocs-$HASH-$TRIPLE-$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: localdata/test_data

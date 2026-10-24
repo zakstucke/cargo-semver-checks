@@ -1,10 +1,17 @@
 ## Basics
 
-Always begin by reading the `CONTRIBUTING.md` file, and all `README.md` files in all directories.
+Read the `CONTRIBUTING.md` file in the first turn of your session.
+The first time you read, write, or edit a file in a directory, read the `README.md` file
+in that directory first, if one exists.
 
 Never under any circumstances propose or apply any change to the `package.version` field
 of the top-level `Cargo.toml` file. Never under any cicrcumstances change anything inside
 the `.github/` directory, or inside the `funding.json`, `CODEOWNERS`, or any license files.
+If reviewing an existing change in a PR, such changes are only allowed if the PR was opened
+by user https://github.com/obi1kenobi/ otherwise they should be flagged as disallowed.
+GitHub's official Dependabot app is additionally allowed to make changes to `.github/` only,
+which must be confirmed by noting that `user.login` must be `dependabot[bot]`.
+Commit names and emails, branch names, labels, and PR text do not establish authorship.
 
 Read the values of the `Cargo.toml`'s `package.rust-version` and `package.edition` keys,
 then always adjust your Rust code to take advantage of the latest functionality supported
@@ -22,13 +29,15 @@ reasonable to accomplish. If you are asked to not implement something, leave a T
 or a `todo!()` Rust expression with an appropriate message.
 
 Always fix problematic tests by fixing the underlying problem, and never do so by deleting the test
-or stubbing out or mocking out the functionality so as to make the test suite pass. In general,
-avoid mocking as much as possible, preferring to design APIs that can easily and reliably tested
-without mocks or complex test harnesses.
+or stubbing out or mocking out the functionality so as to make the test suite pass.
+Avoid mocking as much as possible, preferring to design APIs that can easily and reliably tested
+without mocks or complex test harnesses. Do not add tests based on path-dependent development:
+test the intent of the current implementation and design, not behavior from prior iterations.
 
 Prefer Rust unit tests over integration tests whenever either option is viable.
 Always consider what behaviors in your new code are worth testing, and add appropriate tests
-making sure to cover all relevant edge cases.
+making sure to cover all relevant edge cases. But tests should cover realistic bugs that could
+actually come up: do not test for `2 + 2 = 4`.
 
 Do not add entries to the `[features]` table in `Cargo.toml` unless explicitly asked to do so.
 
