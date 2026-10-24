@@ -87,6 +87,33 @@ impl From<ReleaseType> for ActualSemverUpdate {
     }
 }
 
+/// How the witness is expected to be used in running the lint.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WitnessPurpose {
+    /// The query is expected to only flag true-positive cases,
+    /// so the witness is used to double-check its outputs for false-positives.
+    /// If the witness fails to validate an output,
+    /// then either the query or the witness generator has a bug.
+    #[default]
+    ConsistencyCheck,
+
+    /// The query is necessary but not sufficient to correctly identify true-positives.
+    /// A witness must be generated for each query output, and its outcome determines
+    /// whether the output is a true positive. The query is *not* considered buggy
+    /// even if the witness fails to validate the query's output.
+    RequiredForCorrectness,
+}
+
+impl WitnessPurpose {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConsistencyCheck => "consistency_check",
+            Self::RequiredForCorrectness => "required_for_correctness",
+        }
+    }
+}
+
 /// A query that can be executed on a pair of rustdoc output files,
 /// returning instances of a particular kind of semver violation.
 #[non_exhaustive]
@@ -247,6 +274,10 @@ impl OverrideStack {
 /// for a given `SemverQuery`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Witness {
+    /// The purpose this witness serves in the surrounding query.
+    #[serde(default)]
+    pub purpose: WitnessPurpose,
+
     /// A [`handlebars`] template that renders a user-facing hint to give a quick
     /// explanation of breakage.  This may not be a buildable example, but it should
     /// show the idea of why downstream code could break.  It will be provided all
@@ -948,6 +979,10 @@ mod tests {
         }
     }
 
+    const ORDERING_KEY_COLUMN: &str = "ordering_key";
+    const SPAN_FILENAME_COLUMN: &str = "span_filename";
+    const SPAN_BEGIN_LINE_COLUMN: &str = "span_begin_line";
+
     pub(in crate::query) fn check_query_execution(query_name: &str) {
         let query_text = std::fs::read_to_string(format!("./src/lints/{query_name}.ron")).unwrap();
         let semver_query = SemverQuery::from_ron_str(&query_text).unwrap();
@@ -970,6 +1005,8 @@ mod tests {
                             trustfall_core::frontend::parse(adapter.schema(), &semver_query.query)
                                 .expect("Query failed to parse.")
                         });
+
+                assert_query_outputs_sort_columns(&semver_query.id, indexed_query.as_ref());
 
                 assert_no_false_positives_in_nonchanged_crate(
                     query_name,
@@ -1037,24 +1074,24 @@ mod tests {
                     .collect();
                 SortKey::Explicit(ordering_keys)
             } else {
-                let filename = elem.get("span_filename").map(|value| {
+                let filename = elem.get(SPAN_FILENAME_COLUMN).map(|value| {
                     value
                         .as_arc_str()
-                        .expect("`span_filename` was not a string")
+                        .unwrap_or_else(|| panic!("`{SPAN_FILENAME_COLUMN}` was not a string"))
                 });
                 let line = elem
-                    .get("span_begin_line")
+                    .get(SPAN_BEGIN_LINE_COLUMN)
                     .map(|value: &FieldValue| value.as_usize().expect("begin line was not an int"));
                 match (filename, line) {
                     (Some(filename), Some(line)) => SortKey::Span(Arc::clone(filename), line),
                     (Some(_filename), None) => panic!(
-                        "No `span_begin_line` was returned by the query, even though `span_filename` was present. A valid query must either output an explicit `ordering_key`, or output both `span_filename` and `span_begin_line`. See https://github.com/obi1kenobi/cargo-semver-checks/blob/main/CONTRIBUTING.md for details."
+                        "No `{SPAN_BEGIN_LINE_COLUMN}` was returned by the query, even though `span_filename` was present. A valid query must either output an explicit `ordering_key`, or output both `span_filename` and `{SPAN_BEGIN_LINE_COLUMN}`. See https://github.com/obi1kenobi/cargo-semver-checks/blob/main/CONTRIBUTING.md for details."
                     ),
                     (None, Some(_line)) => panic!(
-                        "No `span_filename` was returned by the query, even though `span_begin_line` was present. A valid query must either output an explicit `ordering_key`, or output both `span_filename` and `span_begin_line`. See https://github.com/obi1kenobi/cargo-semver-checks/blob/main/CONTRIBUTING.md for details."
+                        "No `span_filename` was returned by the query, even though `{SPAN_BEGIN_LINE_COLUMN}` was present. A valid query must either output an explicit `ordering_key`, or output both `span_filename` and `{SPAN_BEGIN_LINE_COLUMN}`. See https://github.com/obi1kenobi/cargo-semver-checks/blob/main/CONTRIBUTING.md for details."
                     ),
                     (None, None) => panic!(
-                        "A valid query must either output an explicit `ordering_key`, or output both `span_filename` and `span_begin_line`. See https://github.com/obi1kenobi/cargo-semver-checks/blob/main/CONTRIBUTING.md for details."
+                        "A valid query must either output an explicit `ordering_key`, or output both `span_filename` and `{SPAN_BEGIN_LINE_COLUMN}`. See https://github.com/obi1kenobi/cargo-semver-checks/blob/main/CONTRIBUTING.md for details."
                     ),
                 }
             }
@@ -1091,10 +1128,7 @@ mod tests {
         if let Some(template) = semver_query.per_result_error_template {
             assert!(!transparent_results.is_empty());
 
-            let flattened_actual_results: Vec<_> = transparent_results
-                .iter()
-                .flat_map(|(_key, value)| value)
-                .collect();
+            let flattened_actual_results: Vec<_> = transparent_results.values().flatten().collect();
             for semver_violation_result in flattened_actual_results {
                 registry
                     .render_template(&template, semver_violation_result)
@@ -1111,13 +1145,13 @@ mod tests {
                         Cow::Borrowed(k.as_str()),
                         v.iter()
                             .map(|values| {
-                                let Some(TransparentValue::String(filename)) = values.get("span_filename") else {
-                                    unreachable!("Missing span_filename String, this should be validated above")
+                                let Some(TransparentValue::String(filename)) = values.get(SPAN_FILENAME_COLUMN) else {
+                                    unreachable!("Missing `{SPAN_FILENAME_COLUMN}` String, this should be validated above")
                                 };
-                                let begin_line = match values.get("span_begin_line") {
+                                let begin_line = match values.get(SPAN_BEGIN_LINE_COLUMN) {
                                     Some(TransparentValue::Int64(i)) => *i as usize,
                                     Some(TransparentValue::Uint64(n)) => *n as usize,
-                                    _ => unreachable!("Missing span_begin_line Int, this should be validated above"),
+                                    _ => unreachable!("Missing `{SPAN_BEGIN_LINE_COLUMN}` Int, this should be validated above"),
                                 };
 
                                 // TODO: Run witness queries and generate full witness here.
@@ -1151,6 +1185,37 @@ mod tests {
                     insta::assert_snapshot!(query_name, formatted_witnesses);
                 }
             );
+        }
+    }
+
+    fn assert_query_outputs_sort_columns(query_name: &str, query_metadata: &IndexedQuery) {
+        // Either the outputs include at least one explicit ordering key column,
+        // or they include both a span filename and a span begin line column.
+        if !query_metadata.outputs.contains_key(ORDERING_KEY_COLUMN) {
+            match (
+                query_metadata.outputs.contains_key(SPAN_FILENAME_COLUMN),
+                query_metadata.outputs.contains_key(SPAN_BEGIN_LINE_COLUMN),
+            ) {
+                (true, true) => {}
+                (true, false) => {
+                    panic!(
+                        "lint query {query_name} contains `{SPAN_FILENAME_COLUMN}` output \
+                        but no `{SPAN_BEGIN_LINE_COLUMN}` output"
+                    );
+                }
+                (false, true) => {
+                    panic!(
+                        "lint query {query_name} contains `{SPAN_BEGIN_LINE_COLUMN}` output \
+                        but no `{SPAN_FILENAME_COLUMN}` output"
+                    );
+                }
+                (false, false) => {
+                    panic!(
+                        "lint query {query_name} has neither an explicit ordering key column, \
+                        nor `{SPAN_FILENAME_COLUMN}` and `{SPAN_BEGIN_LINE_COLUMN}` outputs"
+                    );
+                }
+            }
         }
     }
 
@@ -1441,6 +1506,43 @@ mod tests {
     }
 
     #[test]
+    fn witness_hint_templates_have_whitespace_hygiene() {
+        let mut issues = Vec::new();
+
+        for (query_name, semver_query) in SemverQuery::all_queries() {
+            let Some(witness) = semver_query.witness else {
+                continue;
+            };
+
+            for (line_index, line) in witness.hint_template.lines().enumerate() {
+                if line.ends_with([' ', '\t']) {
+                    issues.push(format!(
+                        "witness hint template for {query_name} has trailing whitespace on line {}: {:?}",
+                        line_index + 1,
+                        line
+                    ));
+                }
+            }
+
+            if witness.hint_template.contains('\n') || witness.hint_template.contains('\r') {
+                let trimmed = witness.hint_template.trim_end_matches(['\r', '\n']);
+                let newline_suffix = &witness.hint_template[trimmed.len()..];
+                if newline_suffix != "\n" && newline_suffix != "\r\n" {
+                    issues.push(format!(
+                        "witness hint template for {query_name} must end with exactly one trailing newline"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            issues.is_empty(),
+            "witness hint templates have whitespace hygiene issues:\n{}",
+            issues.join("\n")
+        );
+    }
+
+    #[test]
     fn test_data_is_fresh() -> anyhow::Result<()> {
         // Adds the modification time of all files in `{dir}/**/*.{rs,toml,json}` to `set`, excluding
         // the `target` directory.
@@ -1616,6 +1718,7 @@ add_lints!(
     (unsafe_trait_method_requires_more_target_features, any(target_arch = "x86", target_arch = "x86_64")),
     (unsafe_trait_method_target_feature_added, any(target_arch = "x86", target_arch = "x86_64")),
     attribute_proc_macro_missing,
+    auto_trait_impl_added,
     auto_trait_impl_removed,
     constructible_struct_adds_field,
     constructible_struct_adds_private_field,
@@ -1637,22 +1740,26 @@ add_lints!(
     enum_non_exhaustive_struct_variant_field_added,
     enum_non_exhaustive_tuple_variant_changed_kind,
     enum_non_exhaustive_tuple_variant_field_added,
+    enum_non_exhaustive_variant_added,
     enum_now_doc_hidden,
     enum_repr_int_added,
     enum_repr_int_changed,
     enum_repr_int_removed,
     enum_repr_transparent_removed,
     enum_repr_variant_discriminant_changed,
+    enum_struct_variant_added,
     enum_struct_variant_changed_kind,
     enum_struct_variant_field_added,
     enum_struct_variant_field_marked_deprecated,
     enum_struct_variant_field_missing,
     enum_struct_variant_field_now_doc_hidden,
+    enum_tuple_variant_added,
     enum_tuple_variant_changed_kind,
     enum_tuple_variant_field_added,
     enum_tuple_variant_field_marked_deprecated,
     enum_tuple_variant_field_missing,
     enum_tuple_variant_field_now_doc_hidden,
+    enum_unit_variant_added,
     enum_unit_variant_changed_kind,
     enum_variant_added,
     enum_variant_marked_deprecated,
@@ -1686,9 +1793,11 @@ add_lints!(
     function_must_use_added,
     function_must_use_removed,
     function_no_longer_unsafe,
+    function_no_longer_variadic,
     function_now_const,
     function_now_doc_hidden,
     function_now_returns_unit,
+    function_now_variadic,
     function_parameter_count_changed,
     function_requires_different_const_generic_params,
     function_requires_different_generic_type_params,
@@ -1707,10 +1816,12 @@ add_lints!(
     inherent_method_must_use_removed,
     inherent_method_no_longer_unsafe,
     inherent_method_no_longer_unwind,
+    inherent_method_no_longer_variadic,
     inherent_method_now_const,
     inherent_method_now_doc_hidden,
     inherent_method_now_returns_unit,
     inherent_method_now_unwind,
+    inherent_method_now_variadic,
     inherent_method_unsafe_added,
     macro_marked_deprecated,
     macro_no_longer_exported,
@@ -1743,6 +1854,8 @@ add_lints!(
     pub_module_level_const_missing,
     pub_module_level_const_now_doc_hidden,
     pub_static_added,
+    pub_static_became_const,
+    pub_static_became_hidden_const,
     pub_static_missing,
     pub_static_mut_now_immutable,
     pub_static_now_doc_hidden,
@@ -1797,9 +1910,11 @@ add_lints!(
     trait_method_missing,
     trait_method_no_longer_has_receiver,
     trait_method_no_longer_unwind,
+    trait_method_no_longer_variadic,
     trait_method_now_doc_hidden,
     trait_method_now_returns_unit,
     trait_method_now_unwind,
+    trait_method_now_variadic,
     trait_method_parameter_count_changed,
     trait_method_receiver_added,
     trait_method_receiver_mut_ref_became_owned,
@@ -1846,6 +1961,7 @@ add_lints!(
     union_changed_to_incompatible_struct,
     union_field_added_with_all_pub_fields,
     union_field_added_with_non_pub_fields,
+    union_field_marked_deprecated,
     union_field_missing,
     union_missing,
     union_must_use_added,

@@ -2,6 +2,21 @@
 source: src/query.rs
 ---
 {
+  "./test_crates/enum_tuple_variant_added/": [
+    {
+      "enum_name": String("VariantChangesKind"),
+      "kind": String("PlainVariant"),
+      "new_kind": String("TupleVariant"),
+      "path": List([
+        String("enum_tuple_variant_added"),
+        String("VariantChangesKind"),
+      ]),
+      "span_begin_line": Uint64(30),
+      "span_end_line": Uint64(30),
+      "span_filename": String("src/lib.rs"),
+      "variant_name": String("Changing"),
+    },
+  ],
   "./test_crates/enum_tuple_variant_field_added/": [
     {
       "enum_name": String("PublicEnum"),
@@ -95,6 +110,21 @@ source: src/query.rs
       "span_end_line": Uint64(25),
       "span_filename": String("src/lib.rs"),
       "variant_name": String("WillBecomeStructLike"),
+    },
+  ],
+  "./test_crates/renamed_enum_with_reexport/": [
+    {
+      "enum_name": String("OldVariants"),
+      "kind": String("PlainVariant"),
+      "new_kind": String("TupleVariant"),
+      "path": List([
+        String("renamed_enum_with_reexport"),
+        String("Variants"),
+      ]),
+      "span_begin_line": Uint64(16),
+      "span_end_line": Uint64(16),
+      "span_filename": String("src/lib.rs"),
+      "variant_name": String("UnitToTuple"),
     },
   ],
 }

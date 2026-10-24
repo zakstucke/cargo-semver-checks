@@ -9,7 +9,8 @@ hint = """
 match value {
     enum_struct_field_hidden_from_public_api::AddedVariantField::TupleVariant (_) => (),
     _ => (),
-}"""
+}
+"""
 
 [["./test_crates/enum_tuple_variant_field_added/"]]
 filename = "src/lib.rs"
@@ -18,4 +19,25 @@ hint = """
 match value {
     enum_tuple_variant_field_added::PublicEnum::TupleVariantWithFieldAdded (_, _) => (),
     _ => (),
-}"""
+}
+"""
+
+[["./test_crates/enum_tuple_variant_field_added/"]]
+filename = "src/lib.rs"
+begin_line = 13
+hint = """
+match value {
+    enum_tuple_variant_field_added::PublicEnum::TupleVariantWithFieldAddedBecomesNonExhaustive (_, _) => (),
+    _ => (),
+}
+"""
+
+[["./test_crates/renamed_enum_with_reexport/"]]
+filename = "src/lib.rs"
+begin_line = 7
+hint = """
+match value {
+    renamed_enum_with_reexport::Variants::TupleFieldAdded (_) => (),
+    _ => (),
+}
+"""

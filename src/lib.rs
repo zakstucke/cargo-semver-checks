@@ -26,13 +26,13 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use check_release::{LintResult, run_check_release};
+use check_release::{CheckReleaseSettings, LintResult, PendingCrateReport, run_check_release};
 use rustdoc_gen::CrateDataForRustdoc;
 
 pub use config::{FeatureFlag, GlobalConfig};
 pub use query::{
     ActualSemverUpdate, LintLevel, OverrideMap, OverrideStack, QueryOverride, RequiredSemverUpdate,
-    SemverQuery, Witness,
+    SemverQuery, Witness, WitnessPurpose,
 };
 
 /// Test a release for semver violations.
@@ -43,6 +43,13 @@ pub struct Check {
     scope: Scope,
     current: Rustdoc,
     baseline: Rustdoc,
+
+    /// Whether we should consider stability attributes when determining public API status.
+    /// Stability attributes are not currently stable, and are only used internally
+    /// in the Rust standard library crates themselves.
+    #[serde(skip_serializing_if = "RustdocIndexingMode::is_ordinary")]
+    rustdoc_indexing_mode: RustdocIndexingMode,
+
     release_type: Option<ReleaseType>,
     current_feature_config: rustdoc_gen::FeatureConfig,
     baseline_feature_config: rustdoc_gen::FeatureConfig,
@@ -68,6 +75,24 @@ pub enum ReleaseType {
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct Rustdoc {
     source: RustdocSource,
+}
+
+/// How rustdoc JSON should be indexed for semver checking.
+#[doc(hidden)]
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum RustdocIndexingMode {
+    /// Index rustdoc JSON using ordinary crate public API rules.
+    #[default]
+    Ordinary,
+    /// Index rustdoc JSON while honoring structured stability metadata.
+    StabilityAware,
+}
+
+impl RustdocIndexingMode {
+    fn is_ordinary(&self) -> bool {
+        matches!(self, Self::Ordinary)
+    }
 }
 
 impl Rustdoc {
@@ -156,6 +181,7 @@ impl Default for ScopeMode {
 #[derive(Default, Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PackageSelection {
     selection: ScopeSelection,
+    explicitly_included_packages: Vec<String>,
     excluded_packages: Vec<String>,
 }
 
@@ -163,8 +189,14 @@ impl PackageSelection {
     pub fn new(selection: ScopeSelection) -> Self {
         Self {
             selection,
+            explicitly_included_packages: vec![],
             excluded_packages: vec![],
         }
+    }
+
+    pub fn set_explicitly_included_packages(&mut self, packages: Vec<String>) -> &mut Self {
+        self.explicitly_included_packages = packages;
+        self
     }
 
     pub fn set_excluded_packages(&mut self, packages: Vec<String>) -> &mut Self {
@@ -196,6 +228,7 @@ impl Scope {
         let base_ids: HashSet<&PackageId> = match &self.mode {
             ScopeMode::DenyList(PackageSelection {
                 selection,
+                explicitly_included_packages: _,
                 excluded_packages,
             }) => {
                 let packages = match selection {
@@ -250,7 +283,7 @@ struct CrateToCheck<'a> {
 /// Is the specified target able to be semver-checked as a library, of any sort.
 ///
 /// This is a broader definition than cargo's own "lib" definition, since we can also
-/// semver-check rlib, dylib, and staticlib targets as well.
+/// semver-check rlib, dylib, cdylib, staticlib, and proc-macro targets as well.
 #[expect(
     clippy::unneeded_struct_pattern,
     reason = "we don't want a breaking change if the target variants change from unit variants to a different kind"
@@ -264,6 +297,7 @@ fn is_lib_like_checkable_target(target: &cargo_metadata::Target) -> bool {
                     | cargo_metadata::TargetKind::DyLib { .. }
                     | cargo_metadata::TargetKind::CDyLib { .. }
                     | cargo_metadata::TargetKind::StaticLib { .. }
+                    | cargo_metadata::TargetKind::ProcMacro { .. }
             )
         })
 }
@@ -274,6 +308,7 @@ impl Check {
             scope: Scope::default(),
             current,
             baseline: Rustdoc::from_registry_latest_crate_version(),
+            rustdoc_indexing_mode: RustdocIndexingMode::default(),
             release_type: None,
             current_feature_config: rustdoc_gen::FeatureConfig::default_for_current(),
             baseline_feature_config: rustdoc_gen::FeatureConfig::default_for_baseline(),
@@ -299,6 +334,12 @@ impl Check {
 
     pub fn set_release_type(&mut self, release_type: ReleaseType) -> &mut Self {
         self.release_type = Some(release_type);
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn set_rustdoc_indexing_mode(&mut self, mode: RustdocIndexingMode) -> &mut Self {
+        self.rustdoc_indexing_mode = mode;
         self
     }
 
@@ -382,7 +423,8 @@ impl Check {
                 rustdoc_gen::RustdocFromFile::new(path.to_owned()).into()
             }
             RustdocSource::Root(root) => {
-                rustdoc_gen::RustdocFromProjectRoot::new(root, &target_dir)?.into()
+                rustdoc_gen::RustdocFromProjectRoot::new(root, &target_dir, Default::default())?
+                    .into()
             }
             RustdocSource::Revision(root, rev) => {
                 let metadata = manifest_metadata_no_deps(root)?;
@@ -408,7 +450,6 @@ impl Check {
     pub fn check_release(&self, config: &mut GlobalConfig) -> anyhow::Result<Report> {
         let generation_settings = data_generation::GenerationSettings {
             use_color: config.err_color_choice(),
-            deps: false,
             pass_through_stderr: config.is_verbose(),
         };
 
@@ -516,7 +557,14 @@ note: skipped the following crates since they have no library target: {skipped}"
                         // ignore `publish = false` crates unless they are specifically selected.
                         // If the manifest points to a specific crate, then check the crate
                         // even if `publish = false` is set.
-                        let is_implied = matches!(self.scope.mode, ScopeMode::DenyList(..))
+                        let is_explicitly_included = match &self.scope.mode {
+                            ScopeMode::AllowList(packages) => packages.contains(&selected.name),
+                            ScopeMode::DenyList(PackageSelection {
+                                explicitly_included_packages,
+                                ..
+                            }) => explicitly_included_packages.contains(&selected.name),
+                        };
+                        let is_implied = !is_explicitly_included
                             && metadata.workspace_members.len() > 1
                             && selected.publish == Some(vec![]);
                         if is_implied {
@@ -575,10 +623,11 @@ note: skipped the following crates since they have no library target: {skipped}"
 
         // Each crate in the workspace may use a different registry
         let mut generators = HashMap::new();
+        let witness_target_dir = self.get_target_dir(&self.current.source)?;
 
         // Create a report for each crate.
         // We want to run all the checks, even if one returns `Err`.
-        let all_outcomes: Vec<anyhow::Result<(String, CrateReport)>> = crates_to_check
+        let all_outcomes: Vec<anyhow::Result<(String, PendingCrateReport)>> = crates_to_check
             .iter()
             .map(|selected| {
                 let current_loader = self.get_rustdoc_generator_for_crate(
@@ -622,7 +671,7 @@ note: skipped the following crates since they have no library target: {skipped}"
                 let witness_data = witness_gen::WitnessGenerationData::new(
                     baseline_loader.get_data_request(),
                     current_loader.get_data_request(),
-                    current_loader.get_target_root(),
+                    witness_target_dir.clone(),
                 );
 
                 let data_storage = generate_crate_data(
@@ -637,7 +686,10 @@ note: skipped the following crates since they have no library target: {skipped}"
                     config,
                     &data_storage,
                     &name,
-                    self.release_type,
+                    CheckReleaseSettings {
+                        release_type: self.release_type,
+                        rustdoc_indexing_mode: self.rustdoc_indexing_mode,
+                    },
                     &selected.overrides,
                     &self.witness_generation,
                     witness_data,
@@ -651,9 +703,34 @@ note: skipped the following crates since they have no library target: {skipped}"
             .collect();
         let crate_reports: BTreeMap<String, CrateReport> = {
             let mut reports = BTreeMap::new();
+            let mut witness_run_reports = Vec::new();
             for outcome in all_outcomes {
                 let (name, outcome) = outcome?;
-                reports.insert(name, outcome);
+                witness_run_reports.push(outcome.witness_run_report);
+                reports.insert(name, outcome.report);
+            }
+
+            match witness_gen::finalize_retained_artifacts(config.run_id(), &witness_run_reports) {
+                Ok(retained_artifact_dirs) => {
+                    if !retained_artifact_dirs.is_empty() {
+                        if retained_artifact_dirs.len() == 1 {
+                            config.shell_note(format_args!(
+                                "retained witness artifacts in {}",
+                                retained_artifact_dirs[0].display()
+                            ))?;
+                        } else {
+                            config.shell_note("retained witness artifacts in:")?;
+                            for dir in retained_artifact_dirs {
+                                writeln!(config.stderr(), "{:12}{}", "", dir.display())?;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    config.shell_warn(format_args!(
+                        "failed to retain witness artifacts: {error:#}"
+                    ))?;
+                }
             }
             reports
         };
@@ -663,7 +740,10 @@ note: skipped the following crates since they have no library target: {skipped}"
 
     fn get_rustdoc_generator_for_crate<'s>(
         &self,
-        loaders: &mut HashMap<(&'s RustdocSource, Option<&'s str>), Rc<rustdoc_gen::RustdocGenerator>>,
+        loaders: &mut HashMap<
+            (&'s RustdocSource, Option<&'s str>),
+            Rc<rustdoc_gen::RustdocGenerator>,
+        >,
         config: &mut GlobalConfig,
         source: &'s RustdocSource,
         crate_data: &'s CrateDataForRustdoc<'_>,
@@ -784,11 +864,17 @@ pub struct CrateReport {
     selected_checks: usize,
     /// Number of ignored queries
     skipped_checks: usize,
+    /// Witness statistics produced while evaluating this crate, if any.
+    witness_statistics: Option<WitnessStatistics>,
 }
 
 impl CrateReport {
-    /// Check if the semver check was successful.
-    /// `true` if required bump <= detected bump.
+    /// Check whether this crate passed the semver check itself.
+    ///
+    /// This only reports whether the crate's authoritative lint results require
+    /// a larger semver bump than was detected. It does not include witness
+    /// execution failures; inspect [`Self::has_required_witness_errors`] or
+    /// [`Self::witness_statistics`] separately when those matter.
     pub fn success(&self) -> bool {
         match self.required_bumps.update_type().map(ReleaseType::from) {
             // If `None`, no additional bump is required.
@@ -818,6 +904,13 @@ impl CrateReport {
         }
     }
 
+    /// Whether required witness validation encountered an execution error.
+    pub fn has_required_witness_errors(&self) -> bool {
+        self.witness_statistics
+            .as_ref()
+            .is_some_and(|statistics| statistics.required_witness_errors() > 0)
+    }
+
     /// Minimum bump required to respect semver.
     /// It's [`Option::None`] if no bump is required beyond the already-detected bump.
     pub fn required_bump(&self) -> Option<ReleaseType> {
@@ -827,6 +920,11 @@ impl CrateReport {
     /// Bump between the current version and the baseline one.
     pub fn detected_bump(&self) -> ActualSemverUpdate {
         self.detected_bump
+    }
+
+    /// Additional witness-related statistics for this crate, if any were produced.
+    pub fn witness_statistics(&self) -> Option<&WitnessStatistics> {
+        self.witness_statistics.as_ref()
     }
 }
 
@@ -840,9 +938,17 @@ pub struct Report {
 }
 
 impl Report {
-    /// `true` if none of the crates violate semver.
+    /// `true` if none of the crates violate SemVer according to authoritative
+    /// lint results.
     pub fn success(&self) -> bool {
         self.crate_reports.values().all(|report| report.success())
+    }
+
+    /// Whether any crate encountered a required witness execution error.
+    pub fn has_required_witness_errors(&self) -> bool {
+        self.crate_reports
+            .values()
+            .any(|report| report.has_required_witness_errors())
     }
 
     /// Reports of each crate checked, sorted by crate name.
@@ -861,20 +967,79 @@ pub struct WitnessGeneration {
     /// Whether to print witness hints, short examples that show why a change is breaking,
     /// while not necessarily buildable standalone programs.  See [`Witness::hint_template`].
     pub show_hints: bool,
-    /// Whether to generate witness programs: longer, fully valid and compilable examples
-    /// of a breaking change. See [`Witness::witness_template`] and [`Witness::witness_query`].
-    pub generate_witnesses: bool,
+    /// Whether to run witness-based consistency checks for lints whose witness purpose is
+    /// [`WitnessPurpose::ConsistencyCheck`]. Witnesses whose purpose is
+    /// [`WitnessPurpose::RequiredForCorrectness`] always run.
+    pub run_consistency_checks: bool,
 }
 
 impl WitnessGeneration {
-    /// Creates a new [`WitnessGeneration`] instance indicating to not generate any witnesses.
+    /// Creates a new [`WitnessGeneration`] instance with all optional witness output disabled.
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
         Self {
             show_hints: false,
-            generate_witnesses: false,
+            run_consistency_checks: false,
         }
+    }
+}
+
+/// Witness-related statistics produced while checking one crate.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WitnessStatistics {
+    not_confirmed_by_witness: usize,
+    consistency_check_mismatches: usize,
+    consistency_check_errors: usize,
+    required_witness_errors: usize,
+}
+
+impl WitnessStatistics {
+    pub(crate) const fn new(
+        not_confirmed_by_witness: usize,
+        consistency_check_mismatches: usize,
+        consistency_check_errors: usize,
+        required_witness_errors: usize,
+    ) -> Self {
+        Self {
+            not_confirmed_by_witness,
+            consistency_check_mismatches,
+            consistency_check_errors,
+            required_witness_errors,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.not_confirmed_by_witness == 0
+            && self.consistency_check_mismatches == 0
+            && self.consistency_check_errors == 0
+            && self.required_witness_errors == 0
+    }
+
+    /// Number of `RequiredForCorrectness` candidate query results that were
+    /// suppressed because the witness also compiled on the current crate,
+    /// disproving the breakage.
+    pub fn not_confirmed_by_witness(&self) -> usize {
+        self.not_confirmed_by_witness
+    }
+
+    /// Number of `ConsistencyCheck` query results whose witness still compiled
+    /// on the current crate. This is unexpected and indicates likely false-positives.
+    pub fn consistency_check_mismatches(&self) -> usize {
+        self.consistency_check_mismatches
+    }
+
+    /// Number of witness execution failures encountered while running
+    /// `ConsistencyCheck` witnesses.
+    pub fn consistency_check_errors(&self) -> usize {
+        self.consistency_check_errors
+    }
+
+    /// Number of witness execution failures encountered while running
+    /// `RequiredForCorrectness` witnesses.
+    pub fn required_witness_errors(&self) -> usize {
+        self.required_witness_errors
     }
 }
 

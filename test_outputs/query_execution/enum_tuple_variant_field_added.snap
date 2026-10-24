@@ -31,5 +31,33 @@ source: src/query.rs
       "span_filename": String("src/lib.rs"),
       "variant_name": String("TupleVariantWithFieldAdded"),
     },
+    {
+      "enum_name": String("PublicEnum"),
+      "field_count": Uint64(2),
+      "field_name": String("2"),
+      "path": List([
+        String("enum_tuple_variant_field_added"),
+        String("PublicEnum"),
+      ]),
+      "span_begin_line": Uint64(13),
+      "span_end_line": Uint64(13),
+      "span_filename": String("src/lib.rs"),
+      "variant_name": String("TupleVariantWithFieldAddedBecomesNonExhaustive"),
+    },
+  ],
+  "./test_crates/renamed_enum_with_reexport/": [
+    {
+      "enum_name": String("NewVariants"),
+      "field_count": Uint64(1),
+      "field_name": String("1"),
+      "path": List([
+        String("renamed_enum_with_reexport"),
+        String("Variants"),
+      ]),
+      "span_begin_line": Uint64(7),
+      "span_end_line": Uint64(7),
+      "span_filename": String("src/lib.rs"),
+      "variant_name": String("TupleFieldAdded"),
+    },
   ],
 }

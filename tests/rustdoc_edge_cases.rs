@@ -28,22 +28,34 @@ fn lib_target_with_dashes() {
         .success();
 }
 
-/// Ensure that proc macro crates without a lib target produce the correct error message
-/// since they have no library API and therefore nothing we can semver-check.
+/// Ensure that proc macro targets can be semver-checked.
 #[test]
 fn proc_macro_target() {
     let mut cmd = cargo_semver_checks();
     cmd.current_dir("test_crates/proc_macro_crate")
         .args(["semver-checks", "check-release", "--baseline-root=."])
-        .env_remove("RUST_BACKTRACE")
         .assert()
-        .stderr(
-            "\
-error: no crates with library targets selected, nothing to semver-check
-note: only library targets contain an API surface that can be checked for semver
-note: skipped the following crates since they have no library target: proc_macro_crate\n",
-        )
-        .failure();
+        .success();
+}
+
+/// Ensure that explicitly selected proc macro crates are checked for API breakage.
+/// https://github.com/obi1kenobi/cargo-semver-checks/discussions/1752
+#[test]
+fn proc_macro_breaking_change() {
+    let mut cmd = cargo_semver_checks();
+    cmd.current_dir("test_crates/function_like_proc_macro_missing/new")
+        .args([
+            "semver-checks",
+            "check-release",
+            "--baseline-root=../old",
+            "--package=function_like_proc_macro_missing",
+        ])
+        .assert()
+        .code(100)
+        .stdout(predicates::str::contains(
+            "failure function_like_proc_macro_missing:",
+        ))
+        .stdout(predicates::str::contains("macro make_answer in file"));
 }
 
 /// Ensure that crates with only a bin target (so, no lib target) produce the correct error message
@@ -116,6 +128,19 @@ fn renamed_lib_target() {
     let mut cmd = cargo_semver_checks();
     cmd.current_dir("test_crates/renamed_lib_target")
         .args(["semver-checks", "check-release", "--baseline-root=."])
+        .assert()
+        .success();
+}
+
+/// Ensure dependency warnings do not fail rustdoc generation when the user has
+/// `RUSTFLAGS=-Dwarnings` set.
+/// https://github.com/obi1kenobi/cargo-semver-checks/issues/589
+#[test]
+fn dependency_warnings_do_not_fail_rustdoc_generation() {
+    let mut cmd = cargo_semver_checks();
+    cmd.current_dir("test_crates/dependency_warnings_with_deny/new")
+        .args(["semver-checks", "check-release", "--baseline-root=../old"])
+        .env("RUSTFLAGS", "-Dwarnings")
         .assert()
         .success();
 }

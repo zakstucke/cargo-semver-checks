@@ -6,15 +6,14 @@ on:
       publish-tag:
         required: true
         type: string
-    secrets:
-      TAGGER_GITHUB_TOKEN:
-        required: true
   workflow_dispatch:
     inputs:
       publish-tag:
         description: git tag to apply to the release commit
         required: true
         type: string
+
+permissions: {}
 
 concurrency:
   group: release
@@ -25,30 +24,82 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  publish:
-    name: Publish to crates.io
+  verify-package:
+    name: Verify package
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Enforce the build-script policy
+        run: python3 .github/scripts/check_build_scripts.py
+
+      - name: Install rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: stable
+          rustflags: ""
+          build-warnings: ""
+          cache: false
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Validate release tag
+        env:
+          PUBLISH_TAG: ${{ inputs.publish-tag }}
+        run: |
+          set -euo pipefail
+          expected_tag="v$(./scripts/get_current_version.sh cargo-semver-checks)"
+          if [[ "$PUBLISH_TAG" != "$expected_tag" ]]; then
+            echo "Expected release tag $expected_tag, got $PUBLISH_TAG" >&2
+            exit 1
+          fi
+          git check-ref-format "refs/tags/$PUBLISH_TAG"
+
+      - name: Verify package
+        run: cargo publish --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --dry-run --locked
+
+  # Package verification compiles the crate, so keep it outside this credentialed job.
+  publish:
+    name: Publish to crates.io
+    needs:
+      - verify-package
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
       id-token: write     # Required for OIDC token exchange (Trusted Publishing)
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: stable
+          rustflags: ""
+          build-warnings: ""
+          cache: false
 
       # For Trusted Publishing:
       # https://crates.io/docs/trusted-publishing
-      - uses: rust-lang/crates-io-auth-action@v1
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
 
       - name: Publish
-        run: cargo publish
+        # Cargo discovers configuration from its working directory, not from
+        # --manifest-path. Run outside the checkout so repository-controlled
+        # configuration cannot change the registry or credential provider while
+        # the publishing token is available.
+        working-directory: ${{ runner.temp }}
+        run: cargo +stable publish --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --no-verify --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
@@ -58,21 +109,27 @@ jobs:
     needs:
       - publish
     if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: true
-          token: ${{ secrets.TAGGER_GITHUB_TOKEN }}
+          persist-credentials: false
 
       - name: Tag the version
         env:
-          GITHUB_TOKEN: ${{ secrets.TAGGER_GITHUB_TOKEN }}
+          # A GITHUB_TOKEN-authenticated tag push does not trigger other workflows.
+          # No repository workflow currently relies on that tag-push event.
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_TAG: ${{ inputs.publish-tag }}
         run: |
-          git tag "${{ inputs.publish-tag }}"
-          git push origin "${{ inputs.publish-tag }}"
+          set -euo pipefail
+          gh auth setup-git
+          git tag -- "$PUBLISH_TAG"
+          git push origin "refs/tags/$PUBLISH_TAG:refs/tags/$PUBLISH_TAG"
 
-      - uses: taiki-e/create-gh-release-action@v1
+      - uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1.11.0
         name: Create github release
         with:
           branch: main
@@ -83,8 +140,10 @@ jobs:
   upload-binary:
     name: Run the build-binaries workflow
     needs:
-      - publish
+      - tag-and-make-release
     if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
     uses: ./.github/workflows/build-binaries.yml
     with:
       publish-tag: ${{ inputs.publish-tag }}

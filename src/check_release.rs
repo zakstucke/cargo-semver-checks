@@ -17,7 +17,9 @@ use crate::query::{
     ActualSemverUpdate, LintLevel, OverrideStack, RequiredSemverUpdate, SemverQuery,
 };
 use crate::witness_gen;
-use crate::{Bumps, CrateReport, GlobalConfig, ReleaseType, WitnessGeneration};
+use crate::{
+    Bumps, CrateReport, GlobalConfig, ReleaseType, RustdocIndexingMode, WitnessGeneration,
+};
 
 /// Represents a change between two semantic versions
 #[derive(Debug, PartialEq, Eq)]
@@ -118,7 +120,7 @@ fn get_minimum_version_change(version: &semver::Version) -> VersionChange {
     }
 }
 
-/// Intermediate state in `run_check_release`
+/// Intermediate state in [`run_check_release`]
 #[derive(Debug)]
 pub(crate) struct LintResult {
     pub semver_query: SemverQuery,
@@ -130,6 +132,22 @@ pub(crate) struct LintResult {
     pub effective_lint_level: LintLevel,
 }
 
+/// Internal per-crate check result that is still pending post-processing
+/// before it can become user-facing data.
+///
+/// [`run_check_release()`] produces this type to hold the user-facing [`CrateReport`]
+/// together with witness bookkeeping that must be finalized only after
+/// all crates in the run have been checked.
+#[derive(Debug)]
+pub(crate) struct PendingCrateReport {
+    /// User-facing semver report after witness evaluation has already rewritten
+    /// the authoritative lint result set.
+    pub(crate) report: CrateReport,
+    /// Internal witness bookkeeping that still needs to be finalized into
+    /// retained run artifacts and manifests after all crates have been checked.
+    pub(crate) witness_run_report: witness_gen::WitnessRunReport,
+}
+
 /// Helper function to print details about a triggered lint.
 fn print_triggered_lint(
     config: &mut GlobalConfig,
@@ -137,11 +155,13 @@ fn print_triggered_lint(
     witness_generation: &WitnessGeneration,
 ) -> anyhow::Result<()> {
     let semver_query = &lint_result.semver_query;
+    let lint_level = lint_result.effective_lint_level;
+
     if let Some(ref_link) = semver_query.reference_link.as_deref() {
-        config.log_info(|config| {
+        config.log_at_lint_level(lint_level, |config| {
             writeln!(config.stdout(), "{}Description:{}\n{}\n{:>12} {}\n{:>12} https://github.com/obi1kenobi/cargo-semver-checks/tree/v{}/src/lints/{}.ron\n",
                 Style::new().bold(), Reset,
-                &semver_query.error_message,
+                semver_query.error_message,
                 "ref:",
                 ref_link,
                 "impl:",
@@ -151,13 +171,13 @@ fn print_triggered_lint(
             Ok(())
         })?;
     } else {
-        config.log_info(|config| {
+        config.log_at_lint_level(lint_level, |config| {
             writeln!(
                 config.stdout(),
                 "{}Description:{}\n{}\n{:>12} https://github.com/obi1kenobi/cargo-semver-checks/tree/v{}/src/lints/{}.ron",
                 Style::new().bold(),
                 Reset,
-                &semver_query.error_message,
+                semver_query.error_message,
                 "impl:",
                 crate_version!(),
                 semver_query.id,
@@ -166,7 +186,7 @@ fn print_triggered_lint(
         })?;
     }
 
-    config.log_info(|config| {
+    config.log_at_lint_level(lint_level, |config| {
         writeln!(
             config.stdout(),
             "{}Failed in:{}",
@@ -188,7 +208,7 @@ fn print_triggered_lint(
                 .render_template(template, &pretty_result)
                 .context("Error instantiating semver query template.")
                 .expect("could not materialize template");
-            config.log_info(|config| {
+            config.log_at_lint_level(lint_level, |config| {
                 writeln!(config.stdout(), "  {message}")?;
                 Ok(())
             })?;
@@ -207,7 +227,7 @@ fn print_triggered_lint(
                 Ok(())
             })?;
         } else {
-            config.log_info(|config| {
+            config.log_at_lint_level(lint_level, |config| {
                 writeln!(
                     config.stdout(),
                     "{}\n",
@@ -225,7 +245,7 @@ fn print_triggered_lint(
                 .render_template(&witness.hint_template, &pretty_result)
                 .context("Error instantiating witness hint template.")?;
 
-            config.log_info(|config| {
+            config.log_at_lint_level(lint_level, |config| {
                 let note = Style::new()
                     .fg_color(Some(Color::Ansi(AnsiColor::Cyan)))
                     .bold();
@@ -242,15 +262,25 @@ fn print_triggered_lint(
     Ok(())
 }
 
+pub(super) struct CheckReleaseSettings {
+    pub(super) release_type: Option<ReleaseType>,
+    pub(super) rustdoc_indexing_mode: RustdocIndexingMode,
+}
+
 pub(super) fn run_check_release(
     config: &mut GlobalConfig,
     data_storage: &DataStorage,
     crate_name: &str,
-    release_type: Option<ReleaseType>,
+    settings: CheckReleaseSettings,
     overrides: &OverrideStack,
     witness_generation: &WitnessGeneration,
     witness_data: witness_gen::WitnessGenerationData,
-) -> anyhow::Result<CrateReport> {
+) -> anyhow::Result<PendingCrateReport> {
+    let CheckReleaseSettings {
+        release_type,
+        rustdoc_indexing_mode,
+    } = settings;
+
     let current_version = data_storage.current_crate().crate_version();
     let baseline_version = data_storage.baseline_crate().crate_version();
 
@@ -296,7 +326,7 @@ pub(super) fn run_check_release(
         VersionChangeKind::Minimum => format!("no change; {assume}{change}"),
     };
 
-    let index_storage = data_storage.create_indexes();
+    let index_storage = data_storage.create_indexes(rustdoc_indexing_mode);
     let adapter = index_storage.create_adapter();
 
     let mut queries_to_run = SemverQuery::all_queries();
@@ -340,7 +370,7 @@ pub(super) fn run_check_release(
         .expect("print failed");
 
     let checks_start_instant = Instant::now();
-    let lint_results = queries_to_run
+    let mut lint_results = queries_to_run
         .into_par_iter()
         .map(|(_, semver_query)| {
             let start_instant = std::time::Instant::now();
@@ -360,9 +390,14 @@ pub(super) fn run_check_release(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    if witness_generation.generate_witnesses {
-        witness_gen::run_witness_checks(config, witness_data, crate_name, &adapter, &lint_results);
-    }
+    let witness_run_report = witness_gen::run_witness_checks(
+        config,
+        witness_generation,
+        witness_data,
+        crate_name,
+        &adapter,
+        &mut lint_results,
+    );
 
     let checks_duration = checks_start_instant.elapsed();
 
@@ -393,10 +428,14 @@ pub(super) fn run_check_release(
         required_bumps,
         suggested_bumps,
         detected_bump: version_change.level,
+        witness_statistics: witness_run_report.statistics.clone(),
     };
 
     print_report(config, witness_generation, &report)?;
-    Ok(report)
+    Ok(PendingCrateReport {
+        report,
+        witness_run_report,
+    })
 }
 
 fn print_report(
@@ -406,6 +445,12 @@ fn print_report(
 ) -> anyhow::Result<()> {
     let mut results_with_errors = vec![];
     let mut results_with_warnings = vec![];
+    let witness_statistics = report.witness_statistics.as_ref();
+    let produced_required_witness_errors =
+        witness_statistics.is_some_and(|statistics| statistics.required_witness_errors() > 0);
+    let produced_witness_warnings = witness_statistics.is_some_and(|statistics| {
+        statistics.consistency_check_mismatches() > 0 || statistics.consistency_check_errors() > 0
+    });
 
     for result in &report.lint_results {
         config
@@ -456,8 +501,12 @@ fn print_report(
 
     let produced_errors = !results_with_errors.is_empty();
     let produced_warnings = !results_with_warnings.is_empty();
-    if produced_errors || produced_warnings {
-        let status_color = if produced_errors {
+    if produced_errors
+        || produced_warnings
+        || produced_required_witness_errors
+        || produced_witness_warnings
+    {
+        let status_color = if produced_errors || produced_required_witness_errors {
             AnsiColor::Red
         } else {
             AnsiColor::Yellow
@@ -482,7 +531,7 @@ fn print_report(
             .expect("print failed");
 
         for lint_result in results_with_errors {
-            config.log_info(|config| {
+            config.log_error(|config| {
                 writeln!(
                     config.stdout(),
                     "\n--- failure {}: {} ---\n",
@@ -496,7 +545,7 @@ fn print_report(
         }
 
         for lint_result in results_with_warnings {
-            config.log_info(|config| {
+            config.log_warn(|config| {
                 writeln!(
                     config.stdout(),
                     "\n--- warning {}: {} ---\n",
@@ -522,7 +571,26 @@ fn print_report(
                 Color::Ansi(AnsiColor::Red),
                 true,
             )?;
-        } else if produced_warnings {
+        } else if produced_required_witness_errors {
+            writeln!(config.stderr())?;
+            let required_witness_errors = witness_statistics
+                .expect("required witness error summary requires witness statistics")
+                .required_witness_errors();
+            config.shell_print(
+                "Summary",
+                format_args!(
+                    "required witness validation failed: encountered \
+                     {required_witness_errors} required witness error{}",
+                    if required_witness_errors == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+                Color::Ansi(AnsiColor::Red),
+                true,
+            )?;
+        } else {
             writeln!(config.stderr())?;
             config.shell_print(
                 "Summary",
@@ -530,8 +598,6 @@ fn print_report(
                 Color::Ansi(AnsiColor::Green),
                 true,
             )?;
-        } else {
-            unreachable!("Expected either warnings or errors to be produced.");
         }
 
         if let Some(suggested_bump) = report.suggested_bumps.update_type() {
@@ -581,12 +647,75 @@ fn print_report(
             true,
         )?;
     }
+
+    if let Some(statistics) = witness_statistics {
+        if statistics.not_confirmed_by_witness() > 0 {
+            config.shell_note(format_args!(
+                "suppressed {} query results that were not confirmed by witness",
+                statistics.not_confirmed_by_witness()
+            ))?;
+        }
+
+        if statistics.consistency_check_mismatches() > 0
+            || statistics.consistency_check_errors() > 0
+        {
+            config.shell_warn(format_args!(
+                "consistency checks found {} results not confirmed by witness \
+                 and {} witness errors",
+                statistics.consistency_check_mismatches(),
+                statistics.consistency_check_errors(),
+            ))?;
+        }
+
+        if statistics.required_witness_errors() > 0 {
+            config.shell_error(format_args!(
+                "encountered {} required witness errors",
+                statistics.required_witness_errors(),
+            ))?;
+        }
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod test {
+    use std::{
+        cell::RefCell,
+        io::{Cursor, Read as _, Seek as _, Write},
+        rc::Rc,
+    };
+
     use super::*;
+
+    #[derive(Clone)]
+    struct SharedBuffer(Rc<RefCell<Cursor<Vec<u8>>>>);
+
+    impl SharedBuffer {
+        fn new() -> Self {
+            Self(Rc::new(RefCell::new(Cursor::new(Vec::new()))))
+        }
+
+        fn contents(&self) -> String {
+            let mut cursor = self.0.borrow_mut();
+            cursor.rewind().expect("failed to rewind shared buffer");
+            let mut output = String::new();
+            cursor
+                .read_to_string(&mut output)
+                .expect("failed to read shared buffer contents");
+            output
+        }
+    }
+
+    impl Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.borrow_mut().flush()
+        }
+    }
 
     #[test]
     fn classify_same_version() {
@@ -790,5 +919,107 @@ mod test {
         };
         let actual = classify_minimum_semver_version_change(baseline, current);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn crate_report_tracks_required_witness_errors_separately_from_semver_success() {
+        let report = CrateReport {
+            detected_bump: ActualSemverUpdate::NotChanged,
+            required_bumps: Bumps { major: 0, minor: 0 },
+            suggested_bumps: Bumps { major: 0, minor: 0 },
+            lint_results: Vec::new(),
+            checks_duration: Duration::ZERO,
+            selected_checks: 1,
+            skipped_checks: 0,
+            witness_statistics: Some(crate::WitnessStatistics::new(0, 0, 0, 1)),
+        };
+
+        assert!(report.success());
+        assert!(report.has_required_witness_errors());
+    }
+
+    #[test]
+    fn report_tracks_required_witness_errors_separately_from_semver_success() {
+        fn create_crate_report(required_witness_errors: usize) -> CrateReport {
+            CrateReport {
+                detected_bump: ActualSemverUpdate::NotChanged,
+                required_bumps: Bumps { major: 0, minor: 0 },
+                suggested_bumps: Bumps { major: 0, minor: 0 },
+                lint_results: Vec::new(),
+                checks_duration: Duration::ZERO,
+                selected_checks: 1,
+                skipped_checks: 0,
+                witness_statistics: Some(crate::WitnessStatistics::new(
+                    0,
+                    0,
+                    0,
+                    required_witness_errors,
+                )),
+            }
+        }
+
+        let report = crate::Report {
+            crate_reports: BTreeMap::from([
+                ("clean".to_owned(), create_crate_report(0)),
+                ("error".to_owned(), create_crate_report(1)),
+            ]),
+        };
+
+        assert!(report.success());
+        assert!(report.has_required_witness_errors());
+    }
+
+    #[test]
+    fn print_report_mentions_not_confirmed_by_witness() {
+        let stdout = SharedBuffer::new();
+        let stderr = SharedBuffer::new();
+        let mut config = GlobalConfig::new();
+        config.set_log_level(Some(log::Level::Info));
+        config.set_stdout(Box::new(stdout.clone()));
+        config.set_stderr(Box::new(stderr.clone()));
+
+        let report = CrateReport {
+            detected_bump: ActualSemverUpdate::NotChanged,
+            required_bumps: Bumps { major: 0, minor: 0 },
+            suggested_bumps: Bumps { major: 0, minor: 0 },
+            lint_results: Vec::new(),
+            checks_duration: Duration::ZERO,
+            selected_checks: 1,
+            skipped_checks: 0,
+            witness_statistics: Some(crate::WitnessStatistics::new(1, 0, 0, 0)),
+        };
+
+        print_report(&mut config, &WitnessGeneration::new(), &report)
+            .expect("failed to print report");
+
+        assert!(stderr.contents().contains("not confirmed by witness"));
+    }
+
+    #[test]
+    fn print_report_does_not_report_success_on_required_witness_errors() {
+        let stdout = SharedBuffer::new();
+        let stderr = SharedBuffer::new();
+        let mut config = GlobalConfig::new();
+        config.set_log_level(Some(log::Level::Info));
+        config.set_stdout(Box::new(stdout));
+        config.set_stderr(Box::new(stderr.clone()));
+
+        let report = CrateReport {
+            detected_bump: ActualSemverUpdate::NotChanged,
+            required_bumps: Bumps { major: 0, minor: 0 },
+            suggested_bumps: Bumps { major: 0, minor: 0 },
+            lint_results: Vec::new(),
+            checks_duration: Duration::ZERO,
+            selected_checks: 1,
+            skipped_checks: 0,
+            witness_statistics: Some(crate::WitnessStatistics::new(0, 0, 0, 1)),
+        };
+
+        print_report(&mut config, &WitnessGeneration::new(), &report)
+            .expect("failed to print report");
+
+        let stderr = stderr.contents();
+        assert!(!stderr.contains("no semver update required"));
+        assert!(stderr.contains("required witness validation failed"));
     }
 }

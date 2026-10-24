@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -5,10 +6,78 @@ use anyhow::Context as _;
 use itertools::Itertools;
 
 use crate::data_generation::request::RequestKind;
+use crate::util::atomic_write;
 
 use super::error::{IntoTerminalResult as _, TerminalError};
 use super::progress::CallbackHandler;
 use super::request::CrateDataRequest;
+
+const EXTRA_RUSTDOCFLAGS: &str = "-Z unstable-options --document-private-items --document-hidden-items --output-format=json --cap-lints=allow";
+
+#[derive(Debug, Clone)]
+pub(crate) struct RustdocBuildEnvironment {
+    pub(crate) target_triple: String,
+    pub(crate) cargo_rustflags: Cow<'static, str>,
+    pub(crate) cargo_rustdocflags: Cow<'static, str>,
+    pub(crate) toolchain_version: String,
+}
+
+impl RustdocBuildEnvironment {
+    pub(crate) fn from_env_and_config_for_target(
+        build_target: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let flags = Flags::from_env_and_config_for_target(build_target)?;
+
+        // Generating rustdoc JSON for a crate also involves checking that crate's dependencies.
+        // The check is done by rustc, not rustdoc, so it's subject to `RUSTFLAGS` not
+        // `RUSTDOCFLAGS`. We don't want rustc to fail that check if the user has set
+        // `RUSTFLAGS="-Dwarnings"` here.
+        // This fixes: https://github.com/obi1kenobi/cargo-semver-checks/issues/589
+        let cargo_rustflags = if flags.rustflags.is_empty() {
+            Cow::Borrowed("--cap-lints=allow")
+        } else {
+            Cow::Owned(format!("{} --cap-lints=allow", flags.rustflags))
+        };
+
+        // Preserve user rustdoc flags, including `--cfg <custom-value>` settings that toggle
+        // what functionality is compiled into the scanned crate.
+        // Suggested in: https://github.com/obi1kenobi/cargo-semver-checks/discussions/1012
+        let cargo_rustdocflags = if flags.rustdocflags.is_empty() {
+            Cow::Borrowed(EXTRA_RUSTDOCFLAGS)
+        } else {
+            Cow::Owned(format!("{} {}", flags.rustdocflags, EXTRA_RUSTDOCFLAGS))
+        };
+
+        // Include the rustdoc toolchain version in artifact identity, since rustdoc JSON may
+        // change across toolchains.
+        let cmd_output = std::process::Command::new("rustdoc")
+            .arg("--version")
+            .output()
+            .context("'rustdoc --version' failed, is Rust installed correctly?")?;
+        if !cmd_output.status.success() {
+            anyhow::bail!(
+                "'rustdoc --version' exited with status {}",
+                cmd_output.status
+            );
+        }
+        let mut toolchain_version = String::from_utf8(cmd_output.stdout)
+            .context("'rustdoc --version' output is not legal UTF-8")?;
+        toolchain_version.truncate(toolchain_version.trim_end().len());
+        let prefix = "rustdoc ";
+        anyhow::ensure!(
+            toolchain_version.starts_with(prefix),
+            "'rustdoc --version' output did not start with 'rustdoc '",
+        );
+        toolchain_version.drain(..prefix.len());
+
+        Ok(Self {
+            target_triple: flags.target_triple,
+            cargo_rustflags,
+            cargo_rustdocflags,
+            toolchain_version,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GenerationSettings {
@@ -18,9 +87,6 @@ pub(crate) struct GenerationSettings {
 
     /// On `true`, pass `--color=always` to `cargo` invocations. On `false`, pass `--color=never`.
     pub(crate) use_color: bool,
-
-    /// On `false`, pass `--no-deps` to `cargo`.
-    pub(crate) deps: bool,
 }
 
 impl GenerationSettings {
@@ -46,6 +112,7 @@ pub(super) fn generate_rustdoc(
     request: &CrateDataRequest<'_>,
     build_dir: &Path,
     settings: GenerationSettings,
+    build_environment: &RustdocBuildEnvironment,
     callbacks: &mut CallbackHandler<'_>,
 ) -> Result<(PathBuf, cargo_metadata::Metadata), TerminalError> {
     let crate_name = request.kind.name().into_terminal_result()?;
@@ -82,7 +149,7 @@ pub(super) fn generate_rustdoc(
         // That issue is tracked here: https://github.com/obi1kenobi/cargo-semver-checks/issues/902
         match run_cargo_update(
             crate_name,
-            version,
+            version.as_ref(),
             request,
             placeholder_manifest_path.as_path(),
             &settings,
@@ -114,8 +181,9 @@ pub(super) fn generate_rustdoc(
         &placeholder_manifest_path,
         target_dir,
         crate_name,
-        version,
+        version.as_ref(),
         &settings,
+        build_environment,
         callbacks,
     )?;
 
@@ -127,7 +195,11 @@ fn produce_repro_workspace_shell_commands(request: &CrateDataRequest<'_>) -> Str
         RequestKind::Registry { .. } => format!(
             "{}@={}",
             request.kind.name().expect("failed to get crate name"),
-            request.kind.version().expect("failed to get crate version")
+            request
+                .kind
+                .version()
+                .expect("failed to get crate version")
+                .as_ref()
         ),
         RequestKind::LocalProject(project) => format!(
             "--path {}",
@@ -209,6 +281,7 @@ fn get_default_build_target_triple(config: &cargo_config2::Config) -> anyhow::Re
 }
 
 struct Flags {
+    target_triple: String,
     rustflags: String,
     rustdocflags: String,
 }
@@ -307,15 +380,78 @@ impl Flags {
             .unwrap_or_default())
     }
 
-    fn from_env_and_config() -> anyhow::Result<Self> {
+    fn from_env_and_config_for_target(build_target: Option<&str>) -> anyhow::Result<Self> {
         let config = cargo_config2::Config::load().context("failed to inspect cargo config")?;
-        let triple = get_default_build_target_triple(&config)?;
+        let triple = match build_target {
+            Some(build_target) => build_target.to_owned(),
+            None => get_default_build_target_triple(&config)?,
+        };
 
         Ok(Self {
             rustflags: Self::determine_rustflags(&config, &triple)?,
             rustdocflags: Self::determine_rustdocflags(&config, &triple)?,
+            target_triple: triple,
         })
     }
+}
+
+fn extract_cfg_related_flags(flags: &str) -> Vec<String> {
+    // TODO: This parser currently splits a flattened flags string on
+    // whitespace, which loses original argument boundaries for quoted or
+    // value-bearing cfg flags like `--cfg 'api="v 2"'` or
+    // `--check-cfg 'cfg(api, values("v 2"))'`. When we revisit witness flag
+    // fidelity, preserve rustflags/rustdocflags as token vectors instead of
+    // flattening and reparsing them here.
+    let tokens = flags.split_whitespace().collect::<Vec<_>>();
+    let mut extracted = Vec::new();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = tokens[index];
+        if matches!(token, "--cfg" | "--check-cfg") {
+            if let Some(value) = tokens.get(index + 1) {
+                extracted.push(token.to_owned());
+                extracted.push((*value).to_owned());
+                index += 2;
+                continue;
+            }
+        } else if token.starts_with("--cfg=") || token.starts_with("--check-cfg=") {
+            extracted.push(token.to_owned());
+        }
+        index += 1;
+    }
+    extracted
+}
+
+fn combine_witness_rustflags(mut rustflags: String, rustdocflags: &str) -> Option<String> {
+    let cfg_related = extract_cfg_related_flags(rustdocflags);
+    if cfg_related.is_empty() {
+        return (!rustflags.is_empty()).then_some(rustflags);
+    }
+
+    if !rustflags.is_empty() {
+        rustflags.push(' ');
+    }
+    rustflags.push_str(&cfg_related.join(" "));
+    Some(rustflags)
+}
+
+/// Returns the effective `RUSTFLAGS` to use when compiling witness scripts for
+/// the given request.
+///
+/// Witnesses are checked with `cargo check`, not `cargo doc`, so cfg-sensitive
+/// behavior that originally came from rustdoc flags has to be replayed here as
+/// rustc flags. Callers should use this helper when they want witness
+/// compilation to preserve the same conditional API surface as the rustdoc
+/// generation step by carrying over ordinary `RUSTFLAGS` plus any cfg-related
+/// settings from the effective `RUSTDOCFLAGS`.
+pub(crate) fn effective_witness_rustflags(
+    request: &CrateDataRequest<'_>,
+) -> anyhow::Result<Option<String>> {
+    let flags = Flags::from_env_and_config_for_target(request.build_target())?;
+    Ok(combine_witness_rustflags(
+        flags.rustflags,
+        &flags.rustdocflags,
+    ))
 }
 
 /// Run `cargo update` inside a placeholder workspace.
@@ -390,40 +526,10 @@ fn run_cargo_doc(
     crate_name: &str,
     version: &str,
     settings: &GenerationSettings,
+    build_environment: &RustdocBuildEnvironment,
     callbacks: &mut CallbackHandler<'_>,
 ) -> Result<PathBuf, TerminalError> {
     let pkg_spec = format!("{crate_name}@{version}");
-
-    // Load the current rustflags and rustdocflags settings.
-    // We'll want to modify them.
-    let Flags {
-        rustflags: mut prior_rustflags,
-        rustdocflags: mut prior_rustdocflags,
-    } = Flags::from_env_and_config().into_terminal_result()?;
-
-    // Generating rustdoc JSON for a crate also involves checking that crate's dependencies.
-    // The check is done by rustc, not rustdoc, so it's subject to `RUSTFLAGS` not `RUSTDOCFLAGS`.
-    // We don't want rustc to fail that check if the user has set `RUSTFLAGS="-Dwarnings"` here.
-    // This fixes: https://github.com/obi1kenobi/cargo-semver-checks/issues/589
-    let rustflags = if !prior_rustflags.is_empty() {
-        prior_rustflags.push_str(" --cap-lints=allow");
-        std::borrow::Cow::Owned(prior_rustflags)
-    } else {
-        std::borrow::Cow::Borrowed("--cap-lints=allow")
-    };
-
-    // Ensure we preserve `RUSTDOCFLAGS` if they are set.
-    // This allows users to supply `--cfg <custom-value>` settings in `RUSTDOCFLAGS`
-    // in order to toggle what functionality is compiled into the scanned crate.
-    // Suggested in: https://github.com/obi1kenobi/cargo-semver-checks/discussions/1012
-    let extra_rustdocflags = "-Z unstable-options --document-private-items --document-hidden-items --output-format=json --cap-lints=allow";
-    let rustdocflags = if !prior_rustdocflags.is_empty() {
-        prior_rustdocflags.push(' ');
-        prior_rustdocflags.push_str(extra_rustdocflags);
-        std::borrow::Cow::Owned(prior_rustdocflags)
-    } else {
-        std::borrow::Cow::Borrowed(extra_rustdocflags)
-    };
 
     // Run the rustdoc generation command on the placeholder crate,
     // specifically requesting the rustdoc of *only* the crate specified in `pkg_spec`.
@@ -436,8 +542,11 @@ fn run_cargo_doc(
     callbacks.generate_rustdoc_start();
     let mut cmd = std::process::Command::new("cargo");
     cmd.env("RUSTC_BOOTSTRAP", "1")
-        .env("RUSTDOCFLAGS", rustdocflags.as_ref())
-        .env("RUSTFLAGS", rustflags.as_ref())
+        .env(
+            "RUSTDOCFLAGS",
+            build_environment.cargo_rustdocflags.as_ref(),
+        )
+        .env("RUSTFLAGS", build_environment.cargo_rustflags.as_ref())
         .stdout(std::process::Stdio::null()) // Don't pollute output
         .stderr(settings.stderr())
         .arg("doc")
@@ -451,9 +560,7 @@ fn run_cargo_doc(
     if let Some(build_target) = request.build_target {
         cmd.arg("--target").arg(build_target);
     }
-    if !settings.deps {
-        cmd.arg("--no-deps");
-    }
+    cmd.arg("--no-deps");
 
     // Respect our configured color choice
     cmd.arg(settings.color_flag());
@@ -494,7 +601,7 @@ fn run_cargo_doc(
         )
         .expect("formatting failed");
 
-        if rustflags.contains("--cfg") {
+        if build_environment.cargo_rustflags.contains("--cfg") {
             writeln!(
                 message,
                 "note: RUSTFLAGS appears to contain '--cfg' arguments."
@@ -709,7 +816,12 @@ fn create_placeholder_rustdoc_manifest(
 
     Ok(Manifest::<()> {
         package: {
-            let mut package = Package::new("placeholder", "0.0.0");
+            let mut package = Package::new(
+                "placeholder",
+                "0.0.0"
+                    .parse()
+                    .expect("hardcoded semver version should parse"),
+            );
             package.publish = Inheritable::Set(Publish::Flag(false));
             Some(package)
         },
@@ -727,7 +839,11 @@ fn create_placeholder_rustdoc_manifest(
                     // We need the *exact* version as a dependency, or else cargo will
                     // give us the latest semver-compatible version which is not we want.
                     // Fixes: https://github.com/obi1kenobi/cargo-semver-checks/issues/261
-                    version: Some(format!("={}", request.kind.version()?)),
+                    version: Some(
+                        format!("={}", request.kind.version()?.as_ref())
+                            .parse()
+                            .context("failed to parse exact dependency version requirement")?,
+                    ),
                     registry: registry_request.registry_name.map(From::from),
                     default_features: request.default_features,
                     features: request
@@ -778,18 +894,48 @@ fn save_placeholder_rustdoc_manifest(
     placeholder_build_dir: &Path,
     placeholder_manifest: cargo_toml::Manifest<()>,
 ) -> anyhow::Result<PathBuf> {
-    std::fs::create_dir_all(placeholder_build_dir).context("failed to create build dir")?;
+    fs_err::create_dir_all(placeholder_build_dir).context("failed to create build dir")?;
     let placeholder_manifest_path = placeholder_build_dir.join("Cargo.toml");
 
     // Possibly fixes https://github.com/libp2p/rust-libp2p/pull/2647#issuecomment-1280221217
-    let _: std::io::Result<()> = std::fs::remove_file(placeholder_build_dir.join("Cargo.lock"));
+    let _: std::io::Result<()> = fs_err::remove_file(placeholder_build_dir.join("Cargo.lock"));
 
-    std::fs::write(
-        &placeholder_manifest_path,
-        toml::to_string(&placeholder_manifest)?,
-    )
+    let placeholder_manifest = toml::to_string(&placeholder_manifest)?;
+    atomic_write(&placeholder_manifest_path, |writer| {
+        writer.write_all(placeholder_manifest.as_bytes())?;
+        Ok(())
+    })
     .context("failed to write placeholder manifest")?;
-    std::fs::write(placeholder_build_dir.join("lib.rs"), "")
+    atomic_write(placeholder_build_dir.join("lib.rs"), |_writer| Ok(()))
         .context("failed to create empty lib.rs")?;
     Ok(placeholder_manifest_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::combine_witness_rustflags;
+
+    #[test]
+    fn combine_witness_rustflags_preserves_existing_rustflags() {
+        assert_eq!(
+            combine_witness_rustflags("--cfg existing".to_owned(), ""),
+            Some("--cfg existing".to_owned())
+        );
+    }
+
+    #[test]
+    fn combine_witness_rustflags_appends_cfg_related_rustdocflags() {
+        assert_eq!(
+            combine_witness_rustflags(
+                "--cfg existing".to_owned(),
+                "--cfg extra --check-cfg=cfg(extra) --document-private-items"
+            ),
+            Some("--cfg existing --cfg extra --check-cfg=cfg(extra)".to_owned())
+        );
+    }
+
+    #[test]
+    fn combine_witness_rustflags_returns_none_when_no_flags_apply() {
+        assert_eq!(combine_witness_rustflags(String::new(), ""), None);
+    }
 }
